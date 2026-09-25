@@ -77,13 +77,24 @@ disclosure does not depend on the model complying.
 ```bash
 npm install
 cp .env.example .env      # fill in the values
-createdb bobdb            # or point DATABASE_URL at any Postgres
-npm start
+npm start                 # applies the schema, then listens on PORT
 npm run register          # register the webhook + verify getWebhookInfo
 ```
 
+The schema is applied on boot, so an empty database is enough — there is no
+separate migration step. `ensureSchema()` is idempotent, so restarting is safe.
+
 Telegram requires a public HTTPS URL for the webhook. Create the bot with
 BotFather, and disable privacy mode so Bob can read all group messages.
+
+### Local Postgres
+
+```bash
+createdb bobdb
+```
+
+`DATABASE_URL` in `.env` points at it. The app also works unchanged against
+Supabase or any managed Postgres; see [Deployment](#deployment).
 
 ## Tests
 
@@ -109,6 +120,47 @@ Notable coverage:
 - the AI-disclosure tests use a stub that deliberately omits the disclosure, so
   they prove the app enforces it rather than the model
 
+## Deployment
+
+`render.yaml` and `Dockerfile` deploy the bot to Render as a Docker service,
+matching the shape used by the sibling `leadgen` and `signalboost` services.
+Push to GitHub, then in Render: **New → Blueprint** and point it at the repo.
+Every secret is `sync: false`, so Render prompts for each one and nothing
+sensitive lives in the repository.
+
+Fill in at deploy time:
+
+| Variable | Notes |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | from BotFather |
+| `DEEPSEEK_API_KEY` | |
+| `DATABASE_URL` | Supabase pooled URL or any Postgres |
+| `WEBHOOK_SECRET` | same value the running service uses |
+| `OWL_API_URL`, `OWL_API_KEY` | optional; unset disables `owl_research` |
+
+`WEBHOOK_URL` is deliberately not in `render.yaml`: it only exists once Render
+has assigned a hostname. Add it, then run `npm run register` locally with the
+same `.env` to point Telegram at the live service.
+
+`register-webhook.js` calls `setWebhook`, then `getWebhookInfo`, and fails
+non-zero if Telegram reports `last_error_message` — a webhook that registers
+but silently fails is otherwise indistinguishable from a healthy one until you
+read that field. It refuses to run with a non-HTTPS URL, a secret shorter than
+16 characters, or a placeholder secret.
+
+### Supabase
+
+Use the **pooled** connection string (port 5432, user `postgres.<ref>`), not
+the direct one. Two reasons:
+
+- the pooler sits in front of a small number of server connections, so
+  `PGPOOL_MAX` defaults to 5 rather than pg's default
+- `ensureSchema()` issues one statement per query, because the pooler's
+  transaction mode rejects a multi-statement string
+
+Paste the pooled URL as `DATABASE_URL`. Nothing else changes; the schema is
+applied on first boot.
+
 ## Environment
 
 See `.env.example`. Missing required variables abort the process at boot with a
@@ -126,9 +178,6 @@ the listening interface.
 
 ## Outstanding setup
 
-Two things must be done outside this repo before the bot meets its PRD in a
-real group.
-
 1. **Privacy mode must be disabled.** `@bob_friendly_ai_bot` is currently
    `can_read_all_group_messages: false`, i.e. Telegram only forwards messages
    that mention Bob or reply to him. That breaks FR-03 (every message
@@ -136,5 +185,9 @@ real group.
    (summarisation trigger), because the older messages are never delivered.
    Fix in BotFather: `/setprivacy` → Disable.
 
-2. **`WEBHOOK_URL` must be a public HTTPS URL**, then run `npm run register`.
+2. **GitHub repo.** The code is committed locally but not pushed; no GitHub
+   token is available in this environment, and SSH can push but cannot create
+   a repository.
+
+3. **`WEBHOOK_URL` must be a public HTTPS URL**, then run `npm run register`.
    Telegram refuses plain HTTP, so a local run needs a tunnel.
