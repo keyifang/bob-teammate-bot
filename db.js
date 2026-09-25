@@ -118,10 +118,15 @@ export async function addParticipant(chatId, userId) {
 }
 
 export async function insertMessage(chatId, userId, sender, text) {
+  // sender is NOT NULL in the schema. A caller passing undefined would abort
+  // the whole update with a constraint violation, so it is normalised here
+  // rather than relying on every caller to remember.
+  const safeSender = sender || "Unknown";
+  const safeText = text ?? "";
   await getPool().query(
     `INSERT INTO messages (chat_id, user_id, sender, text)
      VALUES ($1, $2, $3, $4)`,
-    [chatId, userId, sender, text]
+    [chatId, userId, safeSender, safeText]
   );
   await getPool().query(
     `UPDATE chats SET updated_at = now() WHERE chat_id = $1`,

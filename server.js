@@ -385,10 +385,10 @@ async function handleNewMembers(msg, chatId) {
 
   const inviter = msg.from;
   if (inviter) {
-    await upsertUser(inviter.id, inviter.first_name);
+    await upsertUser(inviter.id, inviter.first_name || inviter.username || "Unknown");
     await setChatOwnerIfUnset(chatId, inviter.id); // FR-01: set once, never reassigned
     await addParticipant(chatId, inviter.id);
-    log(chatId, `owner set to ${inviter.first_name}`);
+    log(chatId, `owner set to ${inviter.first_name || inviter.username || "Unknown"}`);
   }
 
   // Exactly one introduction per chat, ever. A second add must not re-intro
@@ -441,10 +441,20 @@ async function handleUpdate(update) {
   const sender = msg.from;
   if (!sender) return;
 
+  // Telegram delivers a bot's own messages back through the webhook. Without
+  // this guard Bob would store his own reply, decide it warranted a response,
+  // and loop indefinitely - each pass costing two model calls.
+  if (sender.is_bot) return;
+
   const text = msg.text;
   if (!text) return;
 
-  await upsertUser(sender.id, sender.first_name);
+  // first_name is optional in the Bot API: users who set only a username, or
+  // deleted accounts, arrive with no name at all. messages.sender is NOT NULL,
+  // so an unhandled undefined here aborts the whole update (FR-12).
+  const senderName = sender.first_name || sender.last_name || sender.username || "Unknown";
+
+  await upsertUser(sender.id, senderName);
   await addParticipant(chatId, sender.id);
 
   const isPrivate = msg.chat.type === "private";
@@ -455,7 +465,7 @@ async function handleUpdate(update) {
     await setChatOwnerIfUnset(chatId, sender.id);
   }
 
-  await insertMessage(chatId, sender.id, sender.first_name, text);
+  await insertMessage(chatId, sender.id, senderName, text);
 
   const directlyAddressed = isAddressedToBob(msg, text);
 

@@ -146,13 +146,13 @@ async function waitFor(predicate, { timeout = 8000, label = "condition" } = {}) 
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function update({ updateId, chatId, chatType = "group", text, fromId, fromName, username, title, newMembers, replyTo }) {
+function update({ updateId, chatId, chatType = "group", text, fromId, fromName, username, title, newMembers, replyTo, isBot }) {
   return {
     update_id: updateId,
     message: {
       message_id: updateId,
       chat: { id: chatId, type: chatType, title: title ?? "Test chat" },
-      from: { id: fromId, first_name: fromName, username },
+      from: { id: fromId, first_name: fromName, username, is_bot: isBot ?? false },
       text,
       new_chat_members: newMembers,
       reply_to_message: replyTo,
@@ -569,6 +569,111 @@ test("TC-06/TC-07/TC-09: the summarisation cycle prunes to tier A and updates on
   const grace = users.rows.find((r) => Number(r.user_id) === 502);
   assert.notEqual(alice.cross_chat_summary, "ALICE_BEFORE", "owner tier C must be updated");
   assert.equal(grace.cross_chat_summary, "GRACE_UNTOUCHED", "TC-09: collaborator tier C untouched");
+});
+
+test("a message sent by a bot is ignored, so Bob cannot loop on himself", { skip }, async () => {
+  // Telegram feeds a bot its own messages back through the webhook. Without the
+  // is_bot guard Bob stores his own reply, judges it worth answering, and loops
+  // - two model calls per pass, forever.
+  const chatId = 1001;
+  const headers = { "X-Telegram-Bot-Api-Secret-Token": SECRET };
+
+  const before = (await admin.query("SELECT count(*)::int n FROM messages WHERE chat_id = $1", [chatId])).rows[0].n;
+  telegram = [];
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 900,
+      chatId,
+      fromId: 8957151534,
+      fromName: "Bob",
+      username: BOT_USERNAME,
+      isBot: true,
+      text: "here is my own reply",
+    }),
+    headers
+  );
+  await wait(2500);
+
+  const after = (await admin.query("SELECT count(*)::int n FROM messages WHERE chat_id = $1", [chatId])).rows[0].n;
+  assert.equal(after, before, "Bob's own message must not be stored");
+
+  // Scoped to the injected text, not to sender='Bob': Bob's own legitimate
+  // replies are also stored under that name, and counting them would make this
+  // assertion wrong for the wrong reason.
+  const injected = await admin.query(
+    "SELECT count(*)::int n FROM messages WHERE text = $1",
+    ["here is my own reply"]
+  );
+  assert.equal(injected.rows[0].n, 0, "the bot's own text must never be stored");
+
+  assert.equal(
+    telegram.filter((t) => /sendMessage/.test(t.url)).length,
+    0,
+    "Bob must not reply to his own message"
+  );
+});
+
+test("a sender with no first_name does not abort the update", { skip }, async () => {
+  // first_name is optional in the Bot API. messages.sender is NOT NULL, so an
+  // unhandled undefined aborts the update and the group silently goes quiet.
+  const chatId = 4001;
+  const headers = { "X-Telegram-Bot-Api-Secret-Token": SECRET };
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 901,
+      chatId,
+      chatType: "group",
+      title: "No Name Group",
+      fromId: 777001,
+      fromName: undefined,
+      username: "nameless_user",
+      text: `@${BOT_USERNAME} hi without a first name`,
+    }),
+    headers
+  );
+  await wait(1500);
+
+  // Filtered by text: mentioning Bob produces a reply, so the newest row in the
+  // chat is Bob's, not the one under test.
+  const row = await admin.query(
+    "SELECT sender, text FROM messages WHERE chat_id = $1 AND text = $2",
+    [chatId, `@${BOT_USERNAME} hi without a first name`]
+  );
+  assert.equal(row.rows.length, 1, "the message must be persisted");
+  assert.equal(row.rows[0].sender, "nameless_user", "must fall back to the username");
+});
+
+test("a completely nameless sender is stored rather than dropped", { skip }, async () => {
+  const chatId = 4002;
+  const headers = { "X-Telegram-Bot-Api-Secret-Token": SECRET };
+
+  await post(
+    "/telegram-webhook",
+    {
+      update_id: 902,
+      message: {
+        message_id: 1,
+        chat: { id: chatId, type: "group", title: "Anonymous" },
+        from: { id: 777002 },
+        text: "no name at all",
+      },
+    },
+    headers
+  );
+  await wait(1200);
+
+  // Filtered by text for the same reason as the test above: a reply can be the
+  // newest row in the chat, so "latest row" is not "the row under test".
+  const row = await admin.query(
+    "SELECT sender FROM messages WHERE chat_id = $1 AND text = $2",
+    [chatId, "no name at all"]
+  );
+  assert.equal(row.rows.length, 1, "must be persisted, not dropped");
+  assert.equal(row.rows[0].sender, "Unknown");
 });
 
 test("TC-39: no secret appears in the source tree", { skip }, async () => {
