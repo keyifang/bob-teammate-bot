@@ -17,6 +17,13 @@ if (WEBHOOK_SECRET.length < 16) {
   process.exit(1);
 }
 
+// A secret of this length is indistinguishable from the placeholder, and
+// registering with it would lock every update out until someone notices.
+if (/^(pick_a_random|your_|change_?me|placeholder)/i.test(WEBHOOK_SECRET)) {
+  console.error("WEBHOOK_SECRET still looks like a placeholder; refusing to register.");
+  process.exit(1);
+}
+
 const res = await fetch(
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`,
   {

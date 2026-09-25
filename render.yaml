@@ -1,48 +1,80 @@
-services:
-  - type: web
-    name: bob-teammate-bot
-    runtime: node
-    plan: free
-    region: singapore
-    rootDir: bob-teammate-bot
-    buildCommand: npm ci --omit=dev
-    startCommand: npm start
-    healthCheckPath: /health
-    # Node 20+ has global fetch and AbortSignal.timeout, both of which this
-    # codebase relies on. Do not lower this.
-    nodeVersion: 22
-    envVars:
-      - key: NODE_VERSION
-        value: "22"
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: DEEPSEEK_API_URL
-        value: https://api.deepseek.com/chat/completions
-      - key: DEEPSEEK_MODEL
-        value: deepseek-chat
-      - key: DATABASE_URL
-        sync: false
-      - key: WEBHOOK_SECRET
-        sync: false
-      - key: BOB_NAME
-        value: Bob
-      - key: BOB_USERNAME
-        value: bob_friendly_ai_bot
-      - key: HUMANIZE
-        value: "true"
-      - key: UNSOLICITED_COOLDOWN_MS
-        value: "45000"
-      - key: RECENT_MESSAGE_WINDOW
-        value: "20"
-      - key: SUMMARY_TRIGGER_BUFFER
-        value: "20"
-      - key: PGPOOL_MAX
-        value: "5"
-      - key: WEBHOOK_URL
-        sync: false
-      - key: OWL_API_URL
-        sync: false
-      - key: OWL_API_KEY
-        sync: false
+{
+  "services": [
+    {
+      "type": "web",
+      "name": "bob-teammate-bot",
+      "runtime": "docker",
+      "repo": "https://github.com/keyifang/bob-teammate-bot",
+      "plan": "free",
+      "branch": "main",
+      "dockerfilePath": "Dockerfile",
+      "healthCheckPath": "/health",
+      "envVars": [
+        {
+          "key": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "key": "TELEGRAM_BOT_TOKEN",
+          "sync": false
+        },
+        {
+          "key": "DEEPSEEK_API_KEY",
+          "sync": false
+        },
+        {
+          "key": "DEEPSEEK_API_URL",
+          "value": "https://api.deepseek.com/chat/completions"
+        },
+        {
+          "key": "DEEPSEEK_MODEL",
+          "value": "deepseek-chat"
+        },
+        {
+          "key": "DATABASE_URL",
+          "sync": false
+        },
+        {
+          "key": "PGPOOL_MAX",
+          "value": "5"
+        },
+        {
+          "key": "WEBHOOK_SECRET",
+          "sync": false
+        },
+        {
+          "key": "BOB_NAME",
+          "value": "Bob"
+        },
+        {
+          "key": "BOB_USERNAME",
+          "value": "bob_friendly_ai_bot"
+        },
+        {
+          "key": "HUMANIZE",
+          "value": "true"
+        },
+        {
+          "key": "UNSOLICITED_COOLDOWN_MS",
+          "value": "45000"
+        },
+        {
+          "key": "RECENT_MESSAGE_WINDOW",
+          "value": "20"
+        },
+        {
+          "key": "SUMMARY_TRIGGER_BUFFER",
+          "value": "20"
+        },
+        {
+          "key": "OWL_API_URL",
+          "sync": false
+        },
+        {
+          "key": "OWL_API_KEY",
+          "sync": false
+        }
+      ]
+    }
+  ]
+}
