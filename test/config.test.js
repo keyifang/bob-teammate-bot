@@ -122,3 +122,72 @@ test("the pool size is capped for a pooler-backed database", async () => {
   const source = await readFile(path.join(ROOT, "db.js"), "utf8");
   assert.match(source, /max:\s*Number\(process\.env\.PGPOOL_MAX/, "pool max must be configurable and bounded");
 });
+
+// Provider portability. These variables are deliberately generic so the model
+// backend can be swapped in .env alone; a hardcoded provider name or key in
+// the source would undo that and reintroduce a credential in the repo.
+test("server.js has no provider-specific variable names", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  for (const name of ["DEEPSEEK_", "OPENAI_", "OPENROUTER_"]) {
+    assert.ok(
+      !source.includes(name),
+      `server.js still references ${name}; use the provider-agnostic MODEL_* names`
+    );
+  }
+});
+
+test("server.js inlines no model key or provider hostname", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.ok(!/sk-[a-zA-Z0-9_-]{16,}/.test(source), "looks like an inlined API key");
+  assert.ok(
+    !/https:\/\/(api\.deepseek\.com|openrouter\.ai)/.test(source),
+    "provider endpoint must come from the environment"
+  );
+});
+
+test("the model request carries OpenRouter attribution headers", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.match(source, /"HTTP-Referer"\] = "https:\/\/keyi\.ai"/);
+  assert.match(source, /"X-Title"\] = "KeYiCode CLI"/);
+  assert.match(source, /"X-OpenRouter-Categories"\]/);
+});
+
+test("token budgets are configurable and exceed a reasoning model's overhead", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  // A reasoning model spent 194 of 203 completion tokens thinking on a
+  // six-character answer, so a budget in the hundreds truncates the reply.
+  const reply = source.match(/REPLY_MAX_TOKENS = Number\(process\.env\.REPLY_MAX_TOKENS \?\? (\d+)\)/);
+  assert.ok(reply, "REPLY_MAX_TOKENS must have a default");
+  assert.ok(Number(reply[1]) >= 2000, `reply budget too small for reasoning: ${reply[1]}`);
+
+  const summary = source.match(/SUMMARY_MAX_TOKENS = Number\(process\.env\.SUMMARY_MAX_TOKENS \?\? (\d+)\)/);
+  assert.ok(summary, "SUMMARY_MAX_TOKENS must have a default");
+  assert.ok(
+    Number(summary[1]) >= Number(reply[1]),
+    "summarisation folds a whole batch and needs at least the reply budget"
+  );
+
+  // No call site may still use the old hardcoded 500.
+  assert.ok(
+    !/max_tokens:\s*500\b/.test(source),
+    "a hardcoded 500-token budget will truncate reasoning models"
+  );
+});
+
+test("the request timeout outlasts a slow reasoning tool call", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  const m = source.match(/AbortSignal\.timeout\((\d+)\)/);
+  assert.ok(m, "a request timeout must be set");
+  // Measured at ~66s for one tool-calling turn on a free reasoning model.
+  assert.ok(Number(m[1]) >= 120000, `timeout ${m[1]}ms is too short for reasoning models`);
+});
+
+test("reasoning tokens are surfaced in the usage log", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.match(
+    source,
+    /completion_tokens_details\?\.reasoning_tokens/,
+    "reasoning tokens must be broken out or a free model looks like it is spending"
+  );
+  assert.match(source, /usage\.cost/, "OpenRouter's reported cost must be logged");
+});

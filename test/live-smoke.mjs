@@ -7,7 +7,7 @@
 //
 //   node test/live-smoke.mjs
 //
-// Requires DEEPSEEK_API_KEY in .env. Never needs a real bot token.
+// Requires MODEL_API_KEY in .env. Never needs a real bot token.
 
 import http from "node:http";
 import path from "node:path";
@@ -18,8 +18,8 @@ import dotenv from "dotenv";
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: path.join(ROOT, ".env") });
 
-if (!process.env.DEEPSEEK_API_KEY) {
-  console.error("DEEPSEEK_API_KEY is not set in .env");
+if (!process.env.MODEL_API_KEY) {
+  console.error("MODEL_API_KEY is not set in .env");
   process.exit(1);
 }
 
@@ -126,7 +126,11 @@ const res = await fetch(`http://127.0.0.1:${PORT}/telegram-webhook`, {
 });
 console.log(`\nwebhook status: ${res.status}\n`);
 
-const deadline = Date.now() + 90000;
+// A reply costs two model calls on a reasoning model: the answer (~19s measured)
+// plus the humanizer pass. 90s was not enough and reported "NO MESSAGE PRODUCED"
+// for a working system, which reads as a product failure.
+const SMOKE_TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 240000);
+const deadline = Date.now() + SMOKE_TIMEOUT_MS;
 while (Date.now() < deadline && sent.length === 0) await wait(500);
 
 console.log("=".repeat(70));

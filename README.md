@@ -107,8 +107,32 @@ BOB_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/bobdb_test n
 **drop and recreate** that database, so point it at a throwaway one.
 
 The end-to-end suite spawns the real `server.js`, talks to a real Postgres, and
-drives it with real HTTP webhook POSTs. Only Telegram and DeepSeek are stubbed,
-via `TELEGRAM_API_BASE` and `DEEPSEEK_API_URL`.
+drives it with real HTTP webhook POSTs. Only Telegram and the model provider are
+stubbed, via `TELEGRAM_API_BASE` and `MODEL_API_URL`.
+
+## Model provider
+
+Any OpenAI-compatible `chat/completions` endpoint works. The variables are
+deliberately provider-agnostic (`MODEL_API_KEY`, `MODEL_API_URL`, `MODEL_NAME`),
+so switching from OpenRouter to anything else is a `.env` edit.
+
+The default is a **free reasoning model** (`nvidia/nemotron-3.5-lightning:free`),
+which has two consequences worth knowing:
+
+- **Reasoning is billed as completion tokens.** A six-character reply used 194
+  of 203 completion tokens. `max_tokens` must therefore be far above the visible
+  answer length, or the reply arrives empty while the log looks healthy. The
+  budgets live in `REPLY_MAX_TOKENS` and `SUMMARY_MAX_TOKENS`.
+- **Latency is well above the PRD's targets.** A plain reply was measured at
+  ~4s and a tool-calling turn at ~66s, against targets of 6s and 30s. The
+  request timeout is 180s so long turns are not cut off mid-flight, and the
+  typing indicator is kept alive throughout, but a user waiting on a fetch will
+  wait. Switching to a non-reasoning model is the fix if that matters more than
+  cost.
+
+Usage is logged per call, with reasoning tokens broken out and OpenRouter's
+reported `cost` when present.
+
 
 Notable coverage:
 
@@ -133,7 +157,7 @@ Fill in at deploy time:
 | Variable | Notes |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | from BotFather |
-| `DEEPSEEK_API_KEY` | |
+| `MODEL_API_KEY` | OpenRouter key |
 | `DATABASE_URL` | Supabase pooled URL or any Postgres |
 | `WEBHOOK_SECRET` | same value the running service uses |
 | `OWL_API_URL`, `OWL_API_KEY` | optional; unset disables `owl_research` |

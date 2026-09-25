@@ -38,9 +38,9 @@ import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
-  DEEPSEEK_API_KEY,
-  DEEPSEEK_API_URL,
-  DEEPSEEK_MODEL,
+  MODEL_API_KEY,
+  MODEL_API_URL,
+  MODEL_NAME,
   BOB_NAME,
   BOB_USERNAME,
   HUMANIZE,
@@ -63,8 +63,9 @@ const SEEN_UPDATE_LIMIT = 500;
 // webhook that never authenticates). Fail loudly at boot instead (TC-38).
 const REQUIRED_ENV = [
   "TELEGRAM_BOT_TOKEN",
-  "DEEPSEEK_API_KEY",
-  "DEEPSEEK_API_URL",
+  "MODEL_API_KEY",
+  "MODEL_API_URL",
+  "MODEL_NAME",
   "DATABASE_URL",
 ];
 const missingEnv = REQUIRED_ENV.filter((k) => !process.env[k]);
@@ -96,28 +97,49 @@ function log(chatId, message) {
 // ---------------------------------------------------------------------------
 
 // Token usage is logged for every call so running cost is observable (FR-13).
+// Reasoning models bill reasoning tokens as completion tokens, so they are
+// broken out - otherwise a free model looks like it is spending money.
 function logUsage(chatId, label, data) {
   const usage = data?.usage;
   if (!usage) return;
+  const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+  const cost = typeof usage.cost === "number" ? ` cost=$${usage.cost.toFixed(6)}` : "";
   log(
     chatId,
     `${label} tokens: prompt=${usage.prompt_tokens ?? "?"} ` +
-      `completion=${usage.completion_tokens ?? "?"} total=${usage.total_tokens ?? "?"}`
+      `completion=${usage.completion_tokens ?? "?"} total=${usage.total_tokens ?? "?"}` +
+      (reasoning ? ` (reasoning=${reasoning})` : "") +
+      cost
   );
 }
 
-async function deepSeekRequest(chatId, label, payload) {
-  const res = await fetch(DEEPSEEK_API_URL, {
+function modelHeaders() {
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${MODEL_API_KEY}`,
+  };
+  // OpenRouter uses these to attribute traffic; they are harmless and
+  // ignored by any other provider.
+  headers["HTTP-Referer"] = "https://keyi.ai";
+  headers["X-Title"] = "KeYiCode CLI";
+  headers["X-OpenRouter-Categories"] =
+    "cli-agent,cloud-agent,programming-app,native-app-builder,personal-agent";
+  return headers;
+}
+
+async function modelRequest(chatId, label, payload) {
+  const res = await fetch(MODEL_API_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
-    },
+    headers: modelHeaders(),
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(90000),
+    // Reasoning models can spend a long time thinking before emitting any
+    // content, and a tool-calling turn on a free tier was measured at ~66s.
+    // This must exceed the PRD's 30s tool-path target or long turns are cut off
+    // mid-flight and the user sees a fallback instead of an answer.
+    signal: AbortSignal.timeout(180000),
   });
   if (!res.ok) {
-    throw new Error(`DeepSeek error: ${res.status} ${await res.text()}`);
+    throw new Error(`Model error: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
   logUsage(chatId, label, data);
@@ -127,14 +149,14 @@ async function deepSeekRequest(chatId, label, payload) {
 function contentOf(data) {
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== "string") {
-    throw new Error("DeepSeek returned no message content");
+    throw new Error("Model returned no message content");
   }
   return content.trim();
 }
 
-async function callDeepSeek(chatId, systemPrompt, userPrompt, maxTokens = 400, label = "call") {
-  const data = await deepSeekRequest(chatId, label, {
-    model: DEEPSEEK_MODEL,
+async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call") {
+  const data = await modelRequest(chatId, label, {
+    model: MODEL_NAME,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
@@ -145,19 +167,28 @@ async function callDeepSeek(chatId, systemPrompt, userPrompt, maxTokens = 400, l
   return contentOf(data);
 }
 
-async function callDeepSeekWithTools(chatId, systemPrompt, userPrompt) {
+// Reasoning models spend tokens on thinking before any visible content: a
+// 6-character reply consumed 194 of 203 completion tokens. A budget of 500
+// would be entirely consumed by reasoning, so the reply would arrive empty
+// while the log still looked healthy. Reasoning is budgeted for explicitly.
+const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 2000);
+// Summarisation folds a whole batch of messages; it needs more headroom than a
+// chat reply, and still more for a reasoning model.
+const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
+
+async function callModelWithTools(chatId, systemPrompt, userPrompt) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
   ];
 
-  let data = await deepSeekRequest(chatId, "reply", {
-    model: DEEPSEEK_MODEL,
+  let data = await modelRequest(chatId, "reply", {
+    model: MODEL_NAME,
     messages,
     tools: TOOL_SCHEMAS,
     tool_choice: "auto",
     temperature: 0.7,
-    max_tokens: 500,
+    max_tokens: REPLY_MAX_TOKENS,
   });
   let choice = data.choices[0];
   let hops = 0;
@@ -188,13 +219,13 @@ async function callDeepSeekWithTools(chatId, systemPrompt, userPrompt) {
       });
     }
 
-    data = await deepSeekRequest(chatId, `reply hop ${hops + 1}`, {
-      model: DEEPSEEK_MODEL,
+    data = await modelRequest(chatId, `reply hop ${hops + 1}`, {
+      model: MODEL_NAME,
       messages,
       tools: TOOL_SCHEMAS,
       tool_choice: "auto",
       temperature: 0.7,
-      max_tokens: 500,
+      max_tokens: REPLY_MAX_TOKENS,
     });
     choice = data.choices[0];
     hops++;
@@ -206,7 +237,7 @@ async function callDeepSeekWithTools(chatId, systemPrompt, userPrompt) {
 async function humanize(chatId, text) {
   if (HUMANIZE !== "true") return text;
   try {
-    return await callDeepSeek(chatId, HUMANIZER_SYSTEM_PROMPT, text, 300, "humanizer");
+    return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer");
   } catch (err) {
     console.error("Humanizer failed, using raw text:", err.message);
     return text;
@@ -262,7 +293,7 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
 
   let reply;
   try {
-    reply = await callDeepSeekWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt);
   } catch (err) {
     console.error("Reply generation failed:", err.message);
     reply = FALLBACK_REPLY;
@@ -304,11 +335,11 @@ async function summarizeIfNeeded(chatId) {
     `Older messages to fold in:\n${batchTranscript}`,
   ].join("\n\n");
 
-  const updatedSummary = await callDeepSeek(
+  const updatedSummary = await callModel(
     chatId,
     SUMMARIZER_SYSTEM_PROMPT,
     prompt,
-    500,
+    SUMMARY_MAX_TOKENS,
     "summarizer"
   );
 
@@ -331,11 +362,11 @@ async function summarizeIfNeeded(chatId) {
     `Existing summary for ${owner.name}:\n${owner.cross_chat_summary ? owner.cross_chat_summary : "(none yet)"}`,
     `Update from the chat titled "${chatTitle || "untitled"}":\n${updatedSummary}`,
   ].join("\n\n");
-  const merged = await callDeepSeek(
+  const merged = await callModel(
     chatId,
     CROSS_CHAT_SUMMARIZER_PROMPT,
     crossPrompt,
-    500,
+    SUMMARY_MAX_TOKENS,
     "cross-chat summarizer"
   );
   await updateUserCrossChatSummary(owner.user_id, merged);
@@ -403,11 +434,11 @@ async function handleNewMembers(msg, chatId) {
   // without saying anything is worse than a plain sentence (FR-02, FR-12).
   let humanIntro;
   try {
-    const intro = await callDeepSeek(
+    const intro = await callModel(
       chatId,
       PERSONA_SYSTEM_PROMPT,
       INTRO_MESSAGE_PROMPT,
-      200,
+      REPLY_MAX_TOKENS,
       "intro"
     );
     humanIntro = ensureAiDisclosure(await humanize(chatId, intro));

@@ -19,16 +19,16 @@
           "sync": false
         },
         {
-          "key": "DEEPSEEK_API_KEY",
+          "key": "MODEL_API_KEY",
           "sync": false
         },
         {
-          "key": "DEEPSEEK_API_URL",
-          "value": "https://api.deepseek.com/chat/completions"
+          "key": "MODEL_API_URL",
+          "value": "https://openrouter.ai/api/v1/chat/completions"
         },
         {
-          "key": "DEEPSEEK_MODEL",
-          "value": "deepseek-chat"
+          "key": "MODEL_NAME",
+          "value": "nvidia/nemotron-3.5-lightning:free"
         },
         {
           "key": "DATABASE_URL",
@@ -73,6 +73,14 @@
         {
           "key": "OWL_API_KEY",
           "sync": false
+        },
+        {
+          "key": "REPLY_MAX_TOKENS",
+          "value": "2000"
+        },
+        {
+          "key": "SUMMARY_MAX_TOKENS",
+          "value": "4000"
         }
       ]
     }
