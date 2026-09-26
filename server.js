@@ -127,22 +127,34 @@ function modelHeaders() {
   return headers;
 }
 
+// Per-call ceiling. A single tool-calling turn on a free reasoning model was
+// measured at ~66s, and a 3-hop reply is several calls in sequence, so this is
+// generous per call; MAX_TOOL_HOPS and the per-chat queue bound the total.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS ?? 300000);
+// Slow calls are logged rather than hidden: on a free tier this is the normal
+// case, and silence is indistinguishable from a hang.
+const SLOW_CALL_MS = Number(process.env.SLOW_CALL_MS ?? 30000);
+
 async function modelRequest(chatId, label, payload) {
+  const startedAt = Date.now();
   const res = await fetch(MODEL_API_URL, {
     method: "POST",
     headers: modelHeaders(),
     body: JSON.stringify(payload),
-    // Reasoning models can spend a long time thinking before emitting any
-    // content, and a tool-calling turn on a free tier was measured at ~66s.
-    // This must exceed the PRD's 30s tool-path target or long turns are cut off
-    // mid-flight and the user sees a fallback instead of an answer.
-    signal: AbortSignal.timeout(180000),
+    // A free-tier model queues unpredictably and thinks at length, so the wait
+    // is bounded generously rather than tightly. Aborting early means the user
+    // gets the fallback message instead of an answer.
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Model error: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
   logUsage(chatId, label, data);
+  const elapsed = Date.now() - startedAt;
+  if (elapsed > SLOW_CALL_MS) {
+    log(chatId, `${label} was slow: ${(elapsed / 1000).toFixed(1)}s`);
+  }
   return data;
 }
 
@@ -175,6 +187,10 @@ const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 2000);
 // Summarisation folds a whole batch of messages; it needs more headroom than a
 // chat reply, and still more for a reasoning model.
 const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
+// Replies at or below this length are already in the persona's casual register,
+// so the humanizer pass is skipped. Set HUMANIZE_SKIP_UNDER=false to always run.
+const HUMANIZE_MAX_CHARS = Number(process.env.HUMANIZE_MAX_CHARS ?? 400);
+const HUMANIZE_SKIP_UNDER = process.env.HUMANIZE_SKIP_UNDER ?? "true";
 
 async function callModelWithTools(chatId, systemPrompt, userPrompt) {
   const messages = [
@@ -234,8 +250,18 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
   return contentOf(data);
 }
 
+// The humanizer is a full extra model call per reply. On a free reasoning model
+// that measured ~35s and ~1800 reasoning tokens to reword a single sentence -
+// often more than the reply itself. It is skipped for text that is already
+// short and conversational, which is the common case for a chat reply.
 async function humanize(chatId, text) {
   if (HUMANIZE !== "true") return text;
+  // Skip the extra call for replies already short enough to be in the persona's
+  // casual register. HUMANIZE_SKIP_UNDER is opt-out, so setting it to false
+  // restores unconditional humanising.
+  if (HUMANIZE_SKIP_UNDER === "true" && text.length <= HUMANIZE_MAX_CHARS) {
+    return text;
+  }
   try {
     return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer");
   } catch (err) {

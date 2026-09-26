@@ -9,22 +9,30 @@
 import dns from "node:dns/promises";
 import net from "node:net";
 
+// Only tools that can actually run are advertised. Offering a tool that is
+// unconfigured is worse than not offering it: the model calls it, gets a
+// refusal back, and then needs another full model pass to recover - a wasted
+// round trip, and on a slow model a visibly long pause.
 export const TOOL_SCHEMAS = [
-  {
-    type: "function",
-    function: {
-      name: "owl_research",
-      description:
-        "Research current or recent information beyond your training data - news, prices, specs, anything that may have changed. Use this whenever the answer depends on up-to-date facts.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "The research question" },
+  ...(process.env.OWL_API_URL
+    ? [
+        {
+          type: "function",
+          function: {
+            name: "owl_research",
+            description:
+              "Research current or recent information beyond your training data - news, prices, specs, anything that may have changed. Use this whenever the answer depends on up-to-date facts.",
+            parameters: {
+              type: "object",
+              properties: {
+                query: { type: "string", description: "The research question" },
+              },
+              required: ["query"],
+            },
+          },
         },
-        required: ["query"],
-      },
-    },
-  },
+      ]
+    : []),
   {
     type: "function",
     function: {

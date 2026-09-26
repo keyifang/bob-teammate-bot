@@ -176,10 +176,75 @@ test("token budgets are configurable and exceed a reasoning model's overhead", a
 
 test("the request timeout outlasts a slow reasoning tool call", async () => {
   const source = await readFile(path.join(ROOT, "server.js"), "utf8");
-  const m = source.match(/AbortSignal\.timeout\((\d+)\)/);
-  assert.ok(m, "a request timeout must be set");
-  // Measured at ~66s for one tool-calling turn on a free reasoning model.
-  assert.ok(Number(m[1]) >= 120000, `timeout ${m[1]}ms is too short for reasoning models`);
+  // The value is now configurable, so the assertion is on the default rather
+  // than on a literal at the call site.
+  const def = source.match(
+    /REQUEST_TIMEOUT_MS = Number\(process\.env\.REQUEST_TIMEOUT_MS \?\? (\d+)\)/
+  );
+  assert.ok(def, "REQUEST_TIMEOUT_MS must have a default");
+  assert.ok(
+    Number(def[1]) >= 120000,
+    `default timeout ${def[1]}ms is too short for reasoning models`
+  );
+  assert.match(
+    source,
+    /AbortSignal\.timeout\(REQUEST_TIMEOUT_MS\)/,
+    "the request must actually use the configured timeout"
+  );
+});
+
+test("a slow model call is logged rather than silently waited on", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.match(
+    source,
+    /SLOW_CALL_MS/,
+    "a free-tier call taking 30s+ must be visible, not indistinguishable from a hang"
+  );
+  assert.match(source, /was slow/);
+});
+
+test("the humanizer is skipped for short replies", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  // Measured at ~35s and ~1800 reasoning tokens to reword a single sentence on
+  // a free reasoning model, which is the dominant cost of a short reply.
+  assert.match(
+    source,
+    /HUMANIZE_MAX_CHARS/,
+    "short replies must be able to skip the extra model call"
+  );
+  assert.match(
+    source,
+    /text\.length <= HUMANIZE_MAX_CHARS/,
+    "the skip must actually gate the humanizer call"
+  );
+  // It must stay switchable: a user who wants it always on can set the flag.
+  assert.match(source, /HUMANIZE_SKIP_UNDER/, "the skip must be configurable");
+});
+
+test("an unconfigured tool is not advertised to the model", async () => {
+  const source = await readFile(path.join(ROOT, "tools.js"), "utf8");
+  // Offering a tool that cannot run makes the model call it, read the refusal,
+  // and spend another full model pass recovering.
+  assert.match(
+    source,
+    /process\.env\.OWL_API_URL/,
+    "owl_research must only be advertised when it is configured"
+  );
+  const personas = (await readFile(path.join(ROOT, "config.js"), "utf8")).replace(
+    /\s+/g,
+    " "
+  );
+  // Collapsed whitespace: the prompt is hard-wrapped for readability, so a
+  // literal multi-word match would fail on a reflow and pass for the wrong
+  // reason.
+  assert.ok(
+    personas.includes("only listed for you when research is configured"),
+    "the persona must not tell the model it has a tool that may be absent"
+  );
+  assert.ok(
+    personas.includes("Do not pretend to have researched something"),
+    "the persona must forbid faking a tool result"
+  );
 });
 
 test("reasoning tokens are surfaced in the usage log", async () => {

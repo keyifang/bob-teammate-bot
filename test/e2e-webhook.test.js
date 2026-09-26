@@ -564,6 +564,19 @@ test("TC-06/TC-07/TC-09: the summarisation cycle prunes to tier A and updates on
   assert.ok(chatRow.rows[0].summary.length > 0, "TC-07: tier B must be non-empty");
 
   // TC-09: only the owner's tier C moved.
+  // Tier C is written by a SECOND model call after tier B, and the whole
+  // summarisation runs in the background. Waiting only on the prune (tier B)
+  // races it - this failed intermittently until the wait covered both writes.
+  await waitFor(
+    async () => {
+      const r = await admin.query(
+        "SELECT cross_chat_summary FROM users WHERE user_id = 501"
+      );
+      return r.rows[0]?.cross_chat_summary !== "ALICE_BEFORE";
+    },
+    { label: "owner tier C update", timeout: 15000 }
+  );
+
   const users = await admin.query(
     "SELECT user_id, cross_chat_summary FROM users WHERE user_id IN (501, 502) ORDER BY user_id"
   );

@@ -57,8 +57,18 @@ test("executeTool rejects an unknown tool name", async () => {
   await assert.rejects(() => executeTool("rm_rf", {}), /Unknown tool/);
 });
 
-test("owl_research is not mislabeled as an open fetch", () => {
-  assert.equal(TOOL_SCHEMAS.length, 2);
-  const names = TOOL_SCHEMAS.map((t) => t.function.name).sort();
-  assert.deepEqual(names, ["owl_research", "web_fetch"]);
+test("web_fetch is always advertised and is never an open proxy", async () => {
+  // owl_research is only advertised when OWL_API_URL is configured - offering a
+  // tool that cannot run costs a wasted model round trip. web_fetch must always
+  // be present, and the SSRF guard must reject private hosts regardless.
+  const names = TOOL_SCHEMAS.map((t) => t.function.name);
+  assert.ok(names.includes("web_fetch"), "web_fetch must always be advertised");
+  assert.ok(
+    names.every((n) => n === "web_fetch" || n === "owl_research"),
+    `unexpected tool advertised: ${names.join(", ")}`
+  );
+
+  const { assertUrlSafe } = await import("../tools.js");
+  const loopback = await assertUrlSafe("http://127.0.0.1/admin");
+  assert.equal(loopback.ok, false, "the guard must hold regardless of which tools are exposed");
 });
