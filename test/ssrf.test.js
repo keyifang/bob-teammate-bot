@@ -59,12 +59,15 @@ test("executeTool rejects an unknown tool name", async () => {
 
 test("web_fetch is always advertised and is never an open proxy", async () => {
   // owl_research is only advertised when OWL_API_URL is configured - offering a
-  // tool that cannot run costs a wasted model round trip. web_fetch must always
-  // be present, and the SSRF guard must reject private hosts regardless.
+  // tool that cannot run costs a wasted model round trip. web_fetch and
+  // web_search must always be present, and the SSRF guard must reject private
+  // hosts regardless of which tools are exposed.
   const names = TOOL_SCHEMAS.map((t) => t.function.name);
   assert.ok(names.includes("web_fetch"), "web_fetch must always be advertised");
+  assert.ok(names.includes("web_search"), "web_search must always be advertised");
+  const allowed = new Set(["web_fetch", "web_search", "owl_research"]);
   assert.ok(
-    names.every((n) => n === "web_fetch" || n === "owl_research"),
+    names.every((n) => allowed.has(n)),
     `unexpected tool advertised: ${names.join(", ")}`
   );
 

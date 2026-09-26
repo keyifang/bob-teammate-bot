@@ -36,9 +36,28 @@ export const TOOL_SCHEMAS = [
   {
     type: "function",
     function: {
+      name: "web_search",
+      description:
+        "Search the web and get titles, URLs and snippets. Use this for anything time-sensitive or that may have changed - current prices, recent releases, today's news, scores, who won. Use it before answering from memory when the facts could be out of date.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The search query" },
+          max_results: {
+            type: "integer",
+            description: "How many results to return (1-8, default 5)",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "web_fetch",
       description:
-        "Fetch and read the text content of one specific URL someone shared or referenced.",
+        "Fetch and read the full text of one specific URL. Use this when someone shares a link, or to read past the snippet a web_search returned.",
       parameters: {
         type: "object",
         properties: {
@@ -275,8 +294,210 @@ export async function runWebFetch(rawUrl) {
   return "That URL redirected too many times.";
 }
 
+// DuckDuckGo rate-limits by IP and answers a blocked request with 200/202 and
+// a challenge page rather than an error status. It also runs several endpoints
+// with separate limits, so a block is retried against the next one after a
+// short backoff instead of surfacing as "no results found" - which would read
+// as a real answer rather than a failure.
+const SEARCH_ENDPOINTS = [
+  (q) => `https://html.duckduckgo.com/html/?q=${q}`,
+  (q) => `https://lite.duckduckgo.com/lite/?q=${q}`,
+];
+const SEARCH_BROWSER_HEADERS = {
+  // A scripted-looking client gets the challenge page; POST is refused outright
+  // (202 with zero results), so search must be a GET.
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+const SEARCH_RETRY_DELAY_MS = Number(process.env.SEARCH_RETRY_DELAY_MS ?? 1500);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A blocked response is not an error - it parses to zero results. Detecting it
+// explicitly is the difference between "the provider blocked us" and "there is
+// genuinely nothing on the web for this", which are very different answers.
+function isBlockedPage(status, html) {
+  if (status === 202) return true;
+  if (/<title>\s*Captcha/i.test(html)) return true;
+  if (/anomaly\.duckduckgo|challenge\.duckduckgo|unusual traffic/i.test(html)) return true;
+  return false;
+}
+
+function parseSearchHtml(html, maxResults) {
+  const results = [];
+  const seen = new Set();
+  const linkRe =
+    /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  // lite.duckduckgo.com uses a table with result-link rather than the html
+  // endpoint's result__a markup.
+  const liteLinkRe =
+    /<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  const snippetRe =
+    /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  const snippets = [...html.matchAll(snippetRe)].map((m) =>
+    decodeEntities(m[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim()
+  );
+
+  for (const re of [linkRe, liteLinkRe]) {
+    for (const m of html.matchAll(re)) {
+      const href = m[1];
+      const title = decodeEntities(m[2].replace(/<[^>]+>/g, " "))
+        .replace(/\s+/g, " ")
+        .trim();
+      // Outbound links are wrapped as /l/?uddg=<encoded target>.
+      const target = href.match(/uddg=([^&]+)/)?.[1];
+      const resolved = target ? decodeURIComponent(target) : href;
+      if (!/^https?:\/\//i.test(resolved) || seen.has(resolved)) continue;
+      seen.add(resolved);
+      results.push({
+        title,
+        url: resolved,
+        snippet: snippets[results.length] ?? "",
+      });
+      if (results.length >= maxResults) return results;
+    }
+  }
+  return results;
+}
+
+export async function runDdgSearch(query, maxResults = 5) {
+  const text = String(query ?? "").trim();
+  if (!text) return "web_search needs a search query.";
+
+  const limit = Math.min(Math.max(Number(maxResults) || 5, 1), 8);
+  const encoded = encodeURIComponent(text);
+
+  for (let attempt = 0; attempt < SEARCH_ENDPOINTS.length; attempt++) {
+    const url = SEARCH_ENDPOINTS[attempt](encoded);
+    let html;
+    let status;
+    try {
+      const res = await fetch(url, {
+        headers: SEARCH_BROWSER_HEADERS,
+        signal: AbortSignal.timeout(20000),
+      });
+      status = res.status;
+      html = await res.text();
+    } catch (err) {
+      // Never propagate: a throwing tool aborts the whole reply and the user
+      // gets the fallback message instead of an answer. Internals (hostnames,
+      // error codes) stay in the log, not in the model's context.
+      if (attempt < SEARCH_ENDPOINTS.length - 1) {
+        console.error(
+          `web_search: ${new URL(url).hostname} unreachable, trying the next endpoint: ${err.message}`
+        );
+        await sleep(SEARCH_RETRY_DELAY_MS);
+        continue;
+      }
+      console.error(`web_search: all endpoints failed: ${err.message}`);
+      return "The search provider is unavailable right now. Try again shortly - this is temporary.";
+    }
+
+    if (isBlockedPage(status, html)) {
+      if (attempt < SEARCH_ENDPOINTS.length - 1) {
+        console.error(
+          `web_search: ${new URL(url).hostname} returned a challenge page, retrying via the next endpoint`
+        );
+        await sleep(SEARCH_RETRY_DELAY_MS);
+        continue;
+      }
+      return "The search provider is rate-limiting requests right now. Try again shortly - this is temporary.";
+    }
+
+    if (!status || status >= 400) {
+      if (attempt < SEARCH_ENDPOINTS.length - 1) {
+        await sleep(SEARCH_RETRY_DELAY_MS);
+        continue;
+      }
+      if (attempt < SEARCH_ENDPOINTS.length - 1) {
+        await sleep(SEARCH_RETRY_DELAY_MS);
+        continue;
+      }
+      // Never throw: a throwing tool aborts the whole reply and the user gets
+      // the fallback message instead of an answer. A failed search degrades to
+      // a sentence the model can relay.
+      return "The search provider is unavailable right now. Try again shortly - this is temporary.";
+    }
+
+    const results = parseSearchHtml(html, limit);
+    if (results.length) {
+      return results
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`.trimEnd())
+        .join("\n\n");
+    }
+
+    // A 200 that parsed to nothing may still be a soft block rather than an
+    // empty result set, so fall through to the next endpoint before concluding
+    // there is nothing to find.
+    if (attempt < SEARCH_ENDPOINTS.length - 1) {
+      await sleep(SEARCH_RETRY_DELAY_MS);
+      continue;
+    }
+    return `No results for "${text}".`;
+  }
+
+  return "The search provider is rate-limiting requests right now. Try again shortly - this is temporary.";
+}
+// HTML entities in real result titles are effectively unbounded. Rather than
+// enumerate names - and silently leave "&uuml;" in text handed to the model -
+// numeric references are decoded directly and named ones are resolved through
+// the Latin-1 range, which covers the accented letters that actually appear in
+// titles far more often than anything outside it.
+const NAMED_ENTITIES = {
+  quot: String.fromCharCode(34),
+  apos: String.fromCharCode(39),
+  ndash: "-",
+  mdash: "-",
+  hellip: "...",
+  lsquo: String.fromCharCode(39),
+  rsquo: String.fromCharCode(39),
+  ldquo: String.fromCharCode(34),
+  rdquo: String.fromCharCode(34),
+  middot: "-",
+  laquo: "<<",
+  raquo: ">>",
+  bull: "-",
+  deg: " deg ",
+  eacute: "e",
+  egrave: "e",
+  agrave: "a",
+  aacute: "a",
+  acirc: "a",
+  ecirc: "e",
+  icirc: "i",
+  ocirc: "o",
+  ucirc: "u",
+  uuml: "u",
+  ouml: "o",
+  auml: "a",
+  ccedil: "c",
+  ntilde: "n",
+  szlig: "ss",
+  eth: "d",
+  thorn: "th",
+};
+
+function decodeEntities(s) {
+  return String(s).replace(
+    /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z][a-zA-Z0-9]*));/g,
+    (whole, dec, hex, name) => {
+      if (dec !== undefined) return String.fromCodePoint(Number(dec));
+      if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16));
+      const key = name.toLowerCase();
+      if (key === "amp") return "&";
+      if (key === "lt") return "<";
+      if (key === "gt") return ">";
+      if (key === "nbsp") return " ";
+      return key in NAMED_ENTITIES ? NAMED_ENTITIES[key] : whole;
+    }
+  );
+}
+
 export async function executeTool(name, args = {}) {
   if (name === "owl_research") return await runOwlResearch(args.query);
+  if (name === "web_search") return await runDdgSearch(args.query, args.max_results);
   if (name === "web_fetch") return await runWebFetch(args.url);
   throw new Error(`Unknown tool: ${name}`);
 }
