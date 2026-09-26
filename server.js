@@ -158,15 +158,29 @@ async function modelRequest(chatId, label, payload) {
   return data;
 }
 
-function contentOf(data) {
+// A free-tier generation can come back truncated mid-thought - a 4-character
+// "Here" instead of a to-do list, with finish_reason still "stop". Sending
+// that is worse than useless, so a reply too short to be an answer is retried
+// once before the caller falls back.
+const MIN_PLAUSIBLE_REPLY_CHARS = Number(process.env.MIN_PLAUSIBLE_REPLY_CHARS ?? 2);
+
+function contentOf(data, { requireSubstance = false } = {}) {
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== "string") {
     throw new Error("Model returned no message content");
   }
-  return content.trim();
+  const text = content.trim();
+  if (requireSubstance && text.length < MIN_PLAUSIBLE_REPLY_CHARS) {
+    throw new Error(
+      `Model returned a truncated reply (${text.length} chars): ${JSON.stringify(text.slice(0, 60))}`
+    );
+  }
+  return text;
 }
 
-async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call") {
+// One retry for a degenerate reply. Kept separate from the tool loop so a
+// truncation mid-chain is retried with the same message history.
+async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0) {
   const data = await modelRequest(chatId, label, {
     model: MODEL_NAME,
     messages: [
@@ -176,7 +190,13 @@ async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX
     temperature: 0.8,
     max_tokens: maxTokens,
   });
-  return contentOf(data);
+  try {
+    return contentOf(data, { requireSubstance: true });
+  } catch (err) {
+    if (attempt >= 1) throw err;
+    log(chatId, `${label} truncated, retrying once: ${err.message}`);
+    return callModel(chatId, systemPrompt, userPrompt, maxTokens, label, attempt + 1);
+  }
 }
 
 // Reasoning models spend tokens on thinking before any visible content: a
@@ -247,7 +267,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
     hops++;
   }
 
-  return contentOf(data);
+  return contentOf(data, { requireSubstance: true });
 }
 
 // The humanizer is a full extra model call per reply. On a free reasoning model

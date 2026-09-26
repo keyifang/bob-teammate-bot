@@ -256,3 +256,52 @@ test("reasoning tokens are surfaced in the usage log", async () => {
   );
   assert.match(source, /usage\.cost/, "OpenRouter's reported cost must be logged");
 });
+
+// A free-tier generation can come back truncated mid-thought - a measured
+// 4-character "Here" where a six-item to-do list was expected, with
+// finish_reason still "stop". Sending that is worse than useless.
+test("a truncated reply is rejected rather than sent", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.match(
+    source,
+    /MIN_PLAUSIBLE_REPLY_CHARS/,
+    "there must be a floor below which a reply is treated as degenerate"
+  );
+  const m = source.match(
+    /MIN_PLAUSIBLE_REPLY_CHARS = Number\(\s*process\.env\.MIN_PLAUSIBLE_REPLY_CHARS \?\? (\d+)\)/
+  );
+  assert.ok(m, "the floor must have a default");
+  assert.ok(
+    Number(m[1]) >= 2,
+    "a floor below 2 would reject legitimate one-word answers"
+  );
+  assert.match(
+    source,
+    /truncated/,
+    "the failure must be identifiable in the logs"
+  );
+});
+
+test("both model paths require a substantive reply", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  const uses = (source.match(/contentOf\(data, \{ requireSubstance: true \}\)/g) ?? []).length;
+  assert.equal(
+    uses,
+    2,
+    "the plain path and the tool-loop path must both reject a degenerate reply"
+  );
+});
+
+test("a degenerate reply is retried once, not looped", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  assert.match(source, /attempt >= 1/, "the retry must be bounded to one attempt");
+  assert.match(source, /retrying once/);
+});
+
+test("exactly one callModel is defined (a later one would silently win)", async () => {
+  const source = await readFile(path.join(ROOT, "server.js"), "utf8");
+  const defs = (source.match(/^async function callModel\(/gm) ?? []).length;
+  assert.equal(defs, 1, "a duplicate definition would override the retrying one");
+  const contentDefs = (source.match(/^function contentOf\(/gm) ?? []).length;
+  assert.equal(contentDefs, 1, "a duplicate contentOf would override the substance check");
+});

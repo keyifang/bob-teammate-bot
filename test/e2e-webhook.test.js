@@ -11,6 +11,7 @@ import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -160,6 +161,20 @@ function update({ updateId, chatId, chatType = "group", text, fromId, fromName, 
   };
 }
 
+// Asks the OS for an unused port and releases it, so the server child can bind
+// it immediately. A narrow race remains (the port could be taken between the
+// release and the bind) but it is far less likely than a fixed random range.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 // --- lifecycle --------------------------------------------------------------
 
 before(async () => {
@@ -175,7 +190,11 @@ before(async () => {
   );
 
   const uiBase = `http://127.0.0.1:${stubPort}`;
-  serverPort = 3000 + Math.floor(Math.random() * 2000);
+  // A random port collides with a locally running instance often enough to
+  // matter - the harness picked 3000 while the live bot held it, and the whole
+  // suite failed with "timed out waiting for server /health". Bind an ephemeral
+  // port and let the OS choose a free one.
+  serverPort = await freePort();
 
   server = spawn(process.execPath, ["server.js"], {
     cwd: ROOT,
@@ -272,10 +291,19 @@ test("TC-01: Bob joining records the owner and posts an AI intro", { skip }, asy
   );
   assert.equal(res.status, 200);
 
-  await waitFor(async () => {
-    const { rows } = await admin.query("SELECT 1 FROM chats WHERE chat_id = $1", [chatId]);
-    return rows.length === 1;
-  }, { label: "chat row" });
+  // Wait for the owner write, not merely the chat row. getOrCreateChat and
+  // setChatOwnerIfUnset are separate statements, so the row existing says
+  // nothing about ownership - this raced and read NULL.
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT 1 FROM chats WHERE chat_id = $1 AND owner_user_id IS NOT NULL",
+        [chatId]
+      );
+      return rows.length === 1;
+    },
+    { label: "owner recorded" }
+  );
 
   const { rows } = await admin.query(
     "SELECT owner_user_id, intro_sent, title FROM chats WHERE chat_id = $1",
