@@ -8,6 +8,7 @@
 
 import dns from "node:dns/promises";
 import net from "node:net";
+import { fileURLToPath } from "node:url";
 
 // Only tools that can actually run are advertised. Offering a tool that is
 // unconfigured is worse than not offering it: the model calls it, gets a
@@ -294,6 +295,57 @@ export async function runWebFetch(rawUrl) {
   return "That URL redirected too many times.";
 }
 
+// Two backends, tried in order.
+//
+// 1. search.py -> the `ddgs` library, which is a real DuckDuckGo client rather
+//    than a scraper. This is what the owl-basic-research skill uses. It is not
+//    challenged the way the scraped endpoint is: verified returning results
+//    from an IP where html.duckduckgo.com was serving 202 challenge pages.
+// 2. The scraped html/lite endpoints, as a fallback when Python or `ddgs` is
+//    unavailable - notably in the Docker image, which ships no Python.
+//
+// Both report a block honestly instead of returning an empty result set.
+const SEARCH_PYTHON = process.env.SEARCH_PYTHON_BIN ?? "python";
+// fileURLToPath, not URL.pathname: on Windows the pathname keeps percent
+// escapes, so a project path containing spaces becomes "My%20Vibe%20..." and
+// Python cannot open it.
+const SEARCH_SCRIPT = fileURLToPath(new URL("./search.py", import.meta.url));
+const SEARCH_PY_TIMEOUT_MS = Number(process.env.SEARCH_PY_TIMEOUT_MS ?? 45000);
+
+async function searchViaPython(query, maxResults) {
+  const { execFile } = await import("node:child_process");
+  return await new Promise((resolve) => {
+    const child = execFile(
+      SEARCH_PYTHON,
+      [SEARCH_SCRIPT],
+      { timeout: SEARCH_PY_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err && !stdout) {
+          resolve({ ok: false, error: err.message });
+          return;
+        }
+        // The sentinel line survives stray progress output on stdout.
+        const line = String(stdout)
+          .split("\n")
+          .reverse()
+          .find((l) => l.includes(SEARCH_SENTINEL));
+        if (!line) {
+          resolve({ ok: false, error: "no result payload from search helper" });
+          return;
+        }
+        try {
+          resolve(JSON.parse(line.slice(line.indexOf(SEARCH_SENTINEL) + SEARCH_SENTINEL.length)));
+        } catch (parseErr) {
+          resolve({ ok: false, error: `unreadable helper output: ${parseErr.message}` });
+        }
+      }
+    );
+    child.stdin?.end(JSON.stringify({ query, maxResults }));
+  });
+}
+
+const SEARCH_SENTINEL = "@@OWL_SEARCH_JSON@@";
+
 // DuckDuckGo rate-limits by IP and answers a blocked request with 200/202 and
 // a challenge page rather than an error status. It also runs several endpoints
 // with separate limits, so a block is retried against the next one after a
@@ -362,12 +414,35 @@ function parseSearchHtml(html, maxResults) {
   return results;
 }
 
+function formatResults(results) {
+  return results
+    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet ?? ""}`.trimEnd())
+    .join("\n\n");
+}
+
 export async function runDdgSearch(query, maxResults = 5) {
   const text = String(query ?? "").trim();
   if (!text) return "web_search needs a search query.";
 
   const limit = Math.min(Math.max(Number(maxResults) || 5, 1), 8);
   const encoded = encodeURIComponent(text);
+
+  // Backend 1: the ddgs library via search.py. Preferred because it is not
+  // challenged. A miss here falls through to the scraped endpoints rather than
+  // ending the search. Disabled in the test suite, where the tests stub fetch
+  // and a live subprocess would bypass the stub entirely.
+  const pythonEnabled = process.env.SEARCH_DISABLE_PYTHON !== "1";
+  const viaPython = pythonEnabled
+    ? await searchViaPython(text, limit)
+    : { ok: false, error: "disabled" };
+  if (viaPython.ok && Array.isArray(viaPython.results) && viaPython.results.length) {
+    return formatResults(viaPython.results.slice(0, limit));
+  }
+  if (!viaPython.ok) {
+    console.error(`web_search: helper backend unavailable, falling back: ${viaPython.error}`);
+  } else {
+    console.error("web_search: helper returned no results, trying the scraped endpoints");
+  }
 
   for (let attempt = 0; attempt < SEARCH_ENDPOINTS.length; attempt++) {
     const url = SEARCH_ENDPOINTS[attempt](encoded);

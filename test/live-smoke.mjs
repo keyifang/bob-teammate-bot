@@ -28,7 +28,9 @@ const TEST_DB =
   "postgresql://postgres:postgres@127.0.0.1:5432/bobdb_test";
 const BOT_USERNAME = process.env.BOB_USERNAME ?? "bob_friendly_ai_bot";
 const SECRET = "live-smoke-secret";
-const PORT = 4900 + Math.floor(Math.random() * 400);
+// Must stay in the unprivileged range 1024-65535 and avoid ports the test
+// harness itself uses.
+const PORT = Number(process.env.SMOKE_PORT ?? 4300 + Math.floor(Math.random() * 400));
 
 const PROMPT =
   process.argv[2] ??

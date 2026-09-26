@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+// The python helper is a subprocess and would bypass every fetch stub below,
+// so the tests that assert parser behaviour must run against the scrape path.
+process.env.SEARCH_DISABLE_PYTHON = "1";
+
 import { TOOL_SCHEMAS, runDdgSearch, executeTool } from "../tools.js";
 
 const source = () => readFile(new URL("../tools.js", import.meta.url), "utf8");
@@ -303,5 +308,67 @@ test("search never exposes an internal hostname or stack to the model", async ()
     assert.ok(!/ECONNREFUSED|10\.0\.0\.5/.test(out), `internals leaked: ${out}`);
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+// The ddgs helper is the backend that is not challenged, so it is the one that
+// matters. It shells out to Python, which the container image must provide.
+test("the python helper script exists and is shipped", async () => {
+  const { existsSync } = await import("node:fs");
+  const script = fileURLToPath(new URL("../search.py", import.meta.url));
+  assert.ok(existsSync(script), "search.py must exist beside tools.js");
+});
+
+test("the Docker image installs python, or the search tool is dead in production", async () => {
+  const src = await source();
+  assert.ok(src.includes("SEARCH_DISABLE_PYTHON"), "there must be a way to disable the helper");
+  const { readFile } = await import("node:fs/promises");
+  const dockerfile = await readFile(
+    new URL("../Dockerfile", import.meta.url),
+    "utf8"
+  );
+  // node:22-slim ships no Python, so without this line the primary backend
+  // silently never runs in production and only the blocked scrape is left.
+  assert.match(
+    dockerfile,
+    /apt-get[\s\S]*python3|apt-get[\s\S]*python-is-python3|python3/,
+    "the image must install python3 or web_search degrades to the blocked scrape path"
+  );
+});
+
+test("the helper path is decoded, not percent-escaped", async () => {
+  // URL.pathname leaves "My%20Vibe" on Windows, which Python cannot open -
+  // this silently sent every search down the blocked fallback path.
+  const src = await source();
+  assert.match(src, /from "node:url"/);
+  assert.match(src, /fileURLToPath\(new URL\("\.\/search\.py"/);
+  assert.ok(
+    !/new URL\("\.\/search\.py", import\.meta\.url\)\.pathname/.test(src),
+    "URL.pathname keeps percent escapes and breaks paths containing spaces"
+  );
+});
+
+test("a python backend failure falls through to the scraped endpoints", async () => {
+  const seen = [];
+  const original = globalThis.fetch;
+  process.env.SEARCH_PYTHON_BIN = "definitely_not_a_real_binary";
+  globalThis.fetch = async (url) => {
+    seen.push(String(url));
+    return {
+      ok: true,
+      status: 200,
+      text: async () => `<div class="result results_links">
+        <a class="result__a" href="https://ex.org/a">Scrape fallback</a>
+        <a class="result__snippet" href="#">s</a>
+      </div>`,
+    };
+  };
+  try {
+    const out = await runDdgSearch("tokyo", 5);
+    assert.ok(seen.length >= 1, "the scrape fallback must be attempted");
+    assert.ok(out.includes("Scrape fallback"), `fallback did not recover: ${out}`);
+  } finally {
+    globalThis.fetch = original;
+    delete process.env.SEARCH_PYTHON_BIN;
   }
 });

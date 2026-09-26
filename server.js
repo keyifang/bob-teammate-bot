@@ -155,6 +155,15 @@ async function modelRequest(chatId, label, payload) {
   if (elapsed > SLOW_CALL_MS) {
     log(chatId, `${label} was slow: ${(elapsed / 1000).toFixed(1)}s`);
   }
+  // Move any scratchpad the provider put in `content` back into `reasoning`,
+  // so the reply is only ever the answer. Sending it would post the model's
+  // internal monologue - and the system prompt - into a group chat.
+  const message = data?.choices?.[0]?.message;
+  if (message && typeof message.content === "string" && looksLikeReasoningLeak(message.content)) {
+    console.error(`${label}: provider put the scratchpad in content; moving it to reasoning`);
+    message.reasoning = [message.reasoning, message.content].filter(Boolean).join("\n");
+    message.content = null;
+  }
   return data;
 }
 
@@ -163,6 +172,51 @@ async function modelRequest(chatId, label, payload) {
 // that is worse than useless, so a reply too short to be an answer is retried
 // once before the caller falls back.
 const MIN_PLAUSIBLE_REPLY_CHARS = Number(process.env.MIN_PLAUSIBLE_REPLY_CHARS ?? 2);
+
+// A reasoning model sometimes emits its scratchpad into `content` instead of
+// `reasoning` - observed live, where Bob posted the model's internal monologue
+// ("Is 1-3 sentences (usually 1-2) / No preamble, no greetings / ...")
+// straight into a group chat, along with the system prompt and a message it was
+// asked to rewrite. That is a privacy leak and a display defect, so a reply
+// that looks like scratchpad is rejected and retried rather than sent.
+const REASONING_LEAK_RE =
+  /^\s*(?:okay|ok|alright|hmm|so|let me|i need to|i'll|i will|first,?|thinking process|here'?s? (?:a )?thinking)\b[\s\S]{0,4000}?\n\s*(?:1\.|2\.|3\.|step 1|-\s)/i;
+
+function looksLikeReasoningLeak(text) {
+  if (REASONING_LEAK_RE.test(text)) return true;
+  // The scratchpad is a bulleted audit of the instructions, not prose. The
+  // observed leak was four such lines, so the floor is three - a genuine
+  // three-bullet answer to a list request must not trip it, hence the words
+  // that only appear when the model is narrating its own constraints.
+  const lines = text.split("\n");
+  if (lines.length < 3) return false;
+  const metaWords =
+    /^\s*(?:-|\*|\d+\.)\s*(?:no |don'?t |keep |is |has |should |preserve |the |that |style rules|preamble|output only|system prompt|context)/i;
+  const meta = lines.filter((l) => metaWords.test(l)).length;
+  return meta >= 3;
+}
+
+// A free reasoning model can also degenerate into repetition. Observed live:
+// "The networkellsellsellsellsells this the rigor withellsells deep al of the
+// user's request: ..." - which would be posted verbatim into a group chat.
+function looksDegenerate(text) {
+  const trimmed = text.trim();
+  if (trimmed.length < 20) return false;
+
+  // A single token repeated back to back, e.g. "ellsellsellsells".
+  if (/(.{2,12}?)\1{4,}/.test(trimmed)) return true;
+
+  // A short phrase repeated many times, e.g. "the the the the".
+  const words = trimmed.toLowerCase().match(/[a-z']{2,}/g);
+  if (words && words.length >= 12) {
+    const counts = new Map();
+    for (const w of words) counts.set(w, (counts.get(w) ?? 0) + 1);
+    for (const [, n] of counts) {
+      if (n / words.length > 0.5) return true;
+    }
+  }
+  return false;
+}
 
 function contentOf(data, { requireSubstance = false } = {}) {
   const content = data?.choices?.[0]?.message?.content;
@@ -173,6 +227,16 @@ function contentOf(data, { requireSubstance = false } = {}) {
   if (requireSubstance && text.length < MIN_PLAUSIBLE_REPLY_CHARS) {
     throw new Error(
       `Model returned a truncated reply (${text.length} chars): ${JSON.stringify(text.slice(0, 60))}`
+    );
+  }
+  if (requireSubstance && looksLikeReasoningLeak(text)) {
+    throw new Error(
+      `Model returned its scratchpad rather than a reply: ${JSON.stringify(text.slice(0, 80))}`
+    );
+  }
+  if (requireSubstance && looksDegenerate(text)) {
+    throw new Error(
+      `Model returned degenerate repetition: ${JSON.stringify(text.slice(0, 60))}`
     );
   }
   return text;
@@ -229,6 +293,10 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
   let choice = data.choices[0];
   let hops = 0;
 
+  // The hop budget is a hard stop. When it runs out with the model still
+  // asking for another tool, the remaining calls are forced to "none" so it
+  // has to answer from what it already has - otherwise content comes back null
+  // and the user gets nothing at all.
   while (choice.message.tool_calls && hops < 3) {
     messages.push(choice.message);
 
@@ -255,11 +323,15 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
       });
     }
 
+    const isFinalHop = hops + 1 >= 3;
     data = await modelRequest(chatId, `reply hop ${hops + 1}`, {
       model: MODEL_NAME,
       messages,
       tools: TOOL_SCHEMAS,
-      tool_choice: "auto",
+      // On the last permitted hop the model must produce an answer. A model
+      // that keeps chaining tool calls would otherwise return null content and
+      // the user would see nothing.
+      tool_choice: isFinalHop ? "none" : "auto",
       temperature: 0.7,
       max_tokens: REPLY_MAX_TOKENS,
     });
