@@ -144,3 +144,24 @@ test("a non-ASCII transcript is passed through unchanged", () => {
   const prompt = buildReplyPrompt({ bobName: "Bob", transcript });
   assert.ok(prompt.includes(transcript), "transcript must not be mangled");
 });
+
+// Phase 3: a named bot answers from its own memory, and the message being
+// answered is passed separately when it is not yet in the stored transcript.
+test("latest is included and ordered after the transcript", () => {
+  const prompt = buildReplyPrompt({
+    bobName: "Alice",
+    transcript: "Human: earlier line",
+    latest: "Human: the new question",
+  });
+  const ti = prompt.indexOf("earlier line");
+  const li = prompt.indexOf("the new question");
+  assert.ok(ti !== -1 && li !== -1, "both must appear");
+  assert.ok(li > ti, "the newest message must come after the transcript");
+  assert.ok(/Reply as Alice/.test(prompt));
+});
+
+test("with no latest, nothing is invented", () => {
+  const prompt = buildReplyPrompt({ bobName: "Bob", transcript: "Alice: hi" });
+  assert.ok(!/Newest message to answer/.test(prompt));
+  assert.ok(!prompt.includes("undefined"));
+});

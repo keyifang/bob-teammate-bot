@@ -31,10 +31,19 @@ import {
   hasClaimedIntro,
   releaseIntro,
   getChatTitle,
+  getBotsForChat,
+  insertBotMessage,
+  getRecentBotMessages,
+  getBotMessageCount,
+  getBotSummary,
+  updateBotSummary,
+  getBotOwnerMemory,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
+import { routeMessage, stripAddress, isRelay } from "./bots.js";
+import { modelForBot } from "./model-config.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -91,6 +100,27 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
   polling: false,
   baseApiUrl: process.env.TELEGRAM_API_BASE || undefined,
 });
+
+// The relay is the one bot whose token this process holds. Its own telegram id
+// is what lets routing tell the relay apart from the named bots it consults
+// server-side. Learned from getMe at boot; until it arrives the relay simply is
+// not recognised, which degrades to the single-bot behaviour rather than
+// misrouting.
+let relayTelegramUserId = null;
+let relayDisplayName = BOB_NAME ?? "Bob";
+bot
+  .getMe()
+  .then((me) => {
+    relayTelegramUserId = me?.id ?? null;
+    relayDisplayName = me?.first_name || relayDisplayName;
+    // Logged because routing correctness depends on this having arrived; the
+    // e2e harness waits for this line so its named-bot tests are not racing it.
+    console.log(`relay identity: ${relayTelegramUserId}`);
+  })
+  .catch((err) => {
+    console.error("getMe failed; relay identity unknown:", err.message);
+  });
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
@@ -534,12 +564,63 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
   if (tagUnsolicited) await setLastUnsolicitedReply(chatId);
 }
 
+// A named bot is a persona consulted server-side: it has its own memory
+// (bot_messages keyed by bot_id), its own model tier, and its own voice, but
+// only the relay posts to Telegram. Returns the text that was sent, or null if
+// nothing was.
+async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = true } = {}) {
+  const model = modelForBot(bot);
+  const personaName = bot.display_name;
+
+  let reply;
+  try {
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model);
+  } catch (err) {
+    console.error(`Reply from ${personaName} failed:`, err.message);
+    reply = err?.overloaded ? OVERLOADED_REPLY : FALLBACK_REPLY;
+  }
+
+  // Attributed so a multi-bot group can tell who said what.
+  const finalText = `*${personaName}:* ${await humanize(chatId, reply, model)}`;
+  if (record) {
+    await sendFormatted(chatId, finalText);
+    // Recorded against THIS bot's memory, never the relay's, so a later message
+    // to the same bot continues from what it said. The sender is the persona, so
+    // its own transcript reads as a conversation it took part in.
+    await insertBotMessage(bot.bot_id, chatId, personaName, finalText);
+  }
+  return finalText;
+}
+
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
 
 function buildTranscript(messages) {
   return messages.map((m) => `${m.sender}: ${m.text}`).join("\n");
+}
+
+// A named bot answers from ITS OWN memory only: bot_messages for (bot_id,
+// chat_id), its own tier-B summary, and the owner memory that travels with it
+// across groups (requirement 9). Nothing from another bot's transcript can
+// reach this prompt, because every read is keyed by this bot's id.
+async function buildPersonaPrompt(bot, chatId, senderName, text) {
+  const [summary, ownerMemory, recent] = await Promise.all([
+    getBotSummary(bot.bot_id, chatId),
+    getBotOwnerMemory(bot.bot_id),
+    getRecentBotMessages(bot.bot_id, chatId, KEEP_LAST),
+  ]);
+
+  return buildReplyPrompt({
+    bobName: bot.display_name,
+    ownerName: bot.display_name,
+    crossChatSummary: ownerMemory,
+    summary,
+    transcript: buildTranscript(recent),
+    // The latest message is the one being answered; it is not in the stored
+    // transcript yet, so it is appended explicitly.
+    latest: `${senderName}: ${text}`,
+  });
 }
 
 async function summarizeIfNeeded(chatId) {
@@ -722,6 +803,32 @@ async function handleUpdate(update) {
 
   await insertMessage(chatId, sender.id, senderName, text);
 
+  // Named bots: a message that names one is answered by that bot as its own
+  // persona - its own memory, its own model tier, its own voice. routeMessage
+  // returns named bots only (never the relay), so a named call cannot also
+  // trigger the relay and produce two replies. That single rule is what the
+  // filter here would otherwise duplicate; bots.test.js pins it.
+  const namedBots = await getBotsForChat(chatId);
+  const route = routeMessage({
+    bots: namedBots,
+    relayTelegramUserId,
+    text,
+    isPrivate,
+    replyToRelay: isBotUsername(msg.reply_to_message?.from?.username),
+  });
+  const personas = route.bots.filter((b) => !isRelay(b, relayTelegramUserId));
+  if (personas.length) {
+    const cleaned = route.stripName ? stripAddress(text, route.stripName) : text;
+    for (const persona of personas) {
+      const prompt = await buildPersonaPrompt(persona, chatId, senderName, cleaned);
+      await sendNamedBotReply(chatId, sender.id, persona, prompt);
+    }
+    summarizeSafely(chatId);
+    return;
+  }
+
+  // route.relayOnly means the message addressed the relay directly (a DM, or a
+  // reply to it), which the existing direct-address path already handles.
   const directlyAddressed = isAddressedToBob(msg, text);
 
   const jumpingIn =

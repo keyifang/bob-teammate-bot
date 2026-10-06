@@ -74,10 +74,14 @@ const SCHEMA_STATEMENTS = [
   //     is a foreign key, not a column that callers must filter by.
   //
   // Purely additive: no existing table or row is touched.
+  // telegram_user_id is nullable on purpose. In the relay architecture a named
+  // bot is a persona consulted server-side, not a separate Telegram bot - only
+  // the relay holds a token - so a persona has no telegram id. UNIQUE permits
+  // any number of NULLs, so many personas coexist; a real bot still gets one id.
   `CREATE TABLE IF NOT EXISTS bots (
     bot_id BIGSERIAL PRIMARY KEY,
     owner_user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    telegram_user_id BIGINT NOT NULL UNIQUE,
+    telegram_user_id BIGINT UNIQUE,
     telegram_token TEXT,
     display_name TEXT NOT NULL,
     persona TEXT,

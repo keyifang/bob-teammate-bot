@@ -373,3 +373,31 @@ test("getBotsForChat returns every relay participant in position order", { skip 
   assert.ok(bots.every((b) => b.display_name), "each row must carry its display name");
 });
 
+// In the relay architecture the named bots are personas consulted server-side,
+// not separate Telegram bots: only the relay holds a token. So telegram_user_id
+// is NULL for them, and several such personas must coexist. A UNIQUE column
+// permits any number of NULLs, which is exactly what this needs - but only if
+// the column is nullable in the first place.
+test("persona bots have no telegram id and many can coexist", { skip }, async () => {
+  const made = [];
+  for (const name of ["P1", "P2", "P3"]) {
+    made.push(
+      await db.createBot({
+        ownerUserId: OWNER_1,
+        telegramUserId: null,
+        displayName: name,
+      })
+    );
+  }
+  const ids = made.map((b) => Number(b.bot_id));
+  assert.equal(new Set(ids).size, 3, "each persona must get its own bot_id");
+
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM bots WHERE telegram_user_id IS NULL"
+  );
+  assert.ok(rows[0].n >= 3, `expected the NULL-id personas, got ${rows[0].n}`);
+
+  // A persona with no telegram id must not be found by telegram id.
+  assert.equal(await db.getBotByTelegramUserId(null), null);
+});
+

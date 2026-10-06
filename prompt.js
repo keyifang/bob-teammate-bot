@@ -14,6 +14,8 @@
  * @param {string} [input.crossChatSummary] tier C
  * @param {string} [input.summary]        tier B
  * @param {string} [input.transcript]     tier A, already formatted
+ * @param {string} [input.latest]         the message being answered, if it is
+ *                                        not already the last line of transcript
  * @param {boolean} [input.firstContact]  first message in a private chat
  * @returns {string}
  */
@@ -23,6 +25,7 @@ export function buildReplyPrompt({
   crossChatSummary,
   summary,
   transcript,
+  latest,
   firstContact = false,
 }) {
   const sections = [];
@@ -37,6 +40,9 @@ export function buildReplyPrompt({
   }
   if (transcript) {
     sections.push(`Recent messages:\n${transcript}`);
+  }
+  if (latest) {
+    sections.push(`Newest message to answer:\n${latest}`);
   }
   if (firstContact) {
     sections.push(
