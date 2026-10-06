@@ -44,6 +44,7 @@ import { buildReplyPrompt } from "./prompt.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay } from "./bots.js";
 import { modelForBot } from "./model-config.js";
+import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -120,6 +121,11 @@ bot
   .catch((err) => {
     console.error("getMe failed; relay identity unknown:", err.message);
   });
+
+// One live relay turn per chat. A newer turn (a fresh message) supersedes the
+// one in flight, which is what lets a human interject without waiting for a
+// slow model to finish.
+const relayTurns = createTurnRegistry();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -604,7 +610,7 @@ function buildTranscript(messages) {
 // chat_id), its own tier-B summary, and the owner memory that travels with it
 // across groups (requirement 9). Nothing from another bot's transcript can
 // reach this prompt, because every read is keyed by this bot's id.
-async function buildPersonaPrompt(bot, chatId, senderName, text) {
+async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = "") {
   const [summary, ownerMemory, recent] = await Promise.all([
     getBotSummary(bot.bot_id, chatId),
     getBotOwnerMemory(bot.bot_id),
@@ -617,10 +623,37 @@ async function buildPersonaPrompt(bot, chatId, senderName, text) {
     crossChatSummary: ownerMemory,
     summary,
     transcript: buildTranscript(recent),
+    discussion,
     // The latest message is the one being answered; it is not in the stored
     // transcript yet, so it is appended explicitly.
     latest: `${senderName}: ${text}`,
   });
+}
+
+// A relay turn: the addressed bots answer in sequence, each seeing what the
+// ones before said. Bounded by planRelay, and abandoned the moment a newer
+// message arrives, so a slow free model cannot block someone chiming in.
+async function runRelayTurn(chatId, senderId, senderName, text, personas) {
+  const plan = planRelay(personas);
+  const token = relayTurns.begin(chatId);
+  const replies = [];
+
+  for (const persona of plan) {
+    // Checked before each bot, not just at the start: an interjection during
+    // the first bot's generation must stop the rest, not race them.
+    if (!relayTurns.isCurrent(chatId, token)) {
+      log(chatId, `relay turn superseded after ${replies.length} of ${plan.length}`);
+      return replies;
+    }
+
+    const discussion = buildDiscussionContext(replies);
+    const prompt = await buildPersonaPrompt(persona, chatId, senderName, text, discussion);
+    const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt);
+    replies.push({ name: persona.display_name, text: spoken });
+  }
+
+  log(chatId, `relay turn complete: ${replies.length} bot(s) answered`);
+  return replies;
 }
 
 async function summarizeIfNeeded(chatId) {
@@ -803,6 +836,11 @@ async function handleUpdate(update) {
 
   await insertMessage(chatId, sender.id, senderName, text);
 
+  // Any new message supersedes a relay turn still in flight, so a human can
+  // always interject instead of waiting for a slow model. If this message is
+  // itself a relay turn, runRelayTurn begins a newer one on top of this.
+  relayTurns.cancel(chatId);
+
   // Named bots: a message that names one is answered by that bot as its own
   // persona - its own memory, its own model tier, its own voice. routeMessage
   // returns named bots only (never the relay), so a named call cannot also
@@ -819,10 +857,24 @@ async function handleUpdate(update) {
   const personas = route.bots.filter((b) => !isRelay(b, relayTelegramUserId));
   if (personas.length) {
     const cleaned = route.stripName ? stripAddress(text, route.stripName) : text;
-    for (const persona of personas) {
-      const prompt = await buildPersonaPrompt(persona, chatId, senderName, cleaned);
-      await sendNamedBotReply(chatId, sender.id, persona, prompt);
+
+    // One bot addressed: answer as before. Two or more: it is a relay turn, and
+    // the bots answer in sequence seeing each other, rather than posting N
+    // unrelated replies.
+    if (personas.length === 1) {
+      const prompt = await buildPersonaPrompt(personas[0], chatId, senderName, cleaned, "");
+      await sendNamedBotReply(chatId, sender.id, personas[0], prompt);
+      summarizeSafely(chatId);
+      return;
     }
+
+    // Deliberately NOT awaited. The webhook runs one job per chat in order, so
+    // awaiting the turn here would hold the queue for its whole duration - and
+    // the human's interjection would sit behind it, unable to cancel anything.
+    // Starting it detached is what makes chiming in work at all.
+    runRelayTurn(chatId, sender.id, senderName, cleaned, personas).catch((err) =>
+      console.error(`Relay turn failed for chat ${chatId}:`, err.message)
+    );
     summarizeSafely(chatId);
     return;
   }

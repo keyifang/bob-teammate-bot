@@ -165,3 +165,24 @@ test("with no latest, nothing is invented", () => {
   assert.ok(!/Newest message to answer/.test(prompt));
   assert.ok(!prompt.includes("undefined"));
 });
+
+// Phase 5: in a relay turn a later bot sees what earlier bots said, so the
+// group gets a discussion rather than N unrelated answers.
+test("discussion appears after the question and instructs not to repeat", () => {
+  const prompt = buildReplyPrompt({
+    bobName: "Carol",
+    latest: "Human: where should we go?",
+    discussion: "Alice: Lisbon.\nBob: Porto is cheaper.",
+  });
+  assert.ok(prompt.includes("Alice: Lisbon."), "earlier replies must reach the prompt");
+  const qi = prompt.indexOf("where should we go?");
+  const di = prompt.indexOf("Alice: Lisbon.");
+  assert.ok(di > qi, "the discussion must come after the question it responds to");
+  assert.match(prompt, /[Dd]o not repeat/);
+});
+
+test("with no discussion, nothing is invented", () => {
+  const prompt = buildReplyPrompt({ bobName: "Alice", latest: "Human: hi" });
+  assert.ok(!/Others have already answered/.test(prompt));
+  assert.ok(!prompt.includes("undefined"));
+});

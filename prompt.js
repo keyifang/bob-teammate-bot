@@ -16,6 +16,8 @@
  * @param {string} [input.transcript]     tier A, already formatted
  * @param {string} [input.latest]         the message being answered, if it is
  *                                        not already the last line of transcript
+ * @param {string} [input.discussion]     what earlier bots said in this relay
+ *                                        turn, so this bot agrees or disagrees
  * @param {boolean} [input.firstContact]  first message in a private chat
  * @returns {string}
  */
@@ -26,6 +28,7 @@ export function buildReplyPrompt({
   summary,
   transcript,
   latest,
+  discussion,
   firstContact = false,
 }) {
   const sections = [];
@@ -43,6 +46,14 @@ export function buildReplyPrompt({
   }
   if (latest) {
     sections.push(`Newest message to answer:\n${latest}`);
+  }
+  if (discussion) {
+    sections.push(
+      "Others have already answered in this round:\n" +
+        `${discussion}\n` +
+        `Add your own view as ${bobName} - agree, disagree, or add what they ` +
+        "missed. Do not repeat what they said."
+    );
   }
   if (firstContact) {
     sections.push(

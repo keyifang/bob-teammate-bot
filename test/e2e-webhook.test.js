@@ -36,6 +36,10 @@ let stub;
 let stubPort;
 let admin;
 let serverLog = [];
+// Model ids the stub should answer slowly. Used only by the interjection test,
+// which needs the relay turn to still be in flight when the human speaks -
+// otherwise the turn finishes first and cancellation is never exercised.
+const slowModelTiers = new Set();
 
 // --- stubs -----------------------------------------------------------------
 
@@ -88,13 +92,20 @@ function startStub() {
             content = "Hey, Bob here. Happy to help out.";
           }
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              choices: [{ message: { role: "assistant", content } }],
-              usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
-            })
-          );
+          const respond = () => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                choices: [{ message: { role: "assistant", content } }],
+                usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+              })
+            );
+          };
+
+          // A tier registered as slow answers after a delay, so a relay turn is
+          // still in flight when the test injects a human message.
+          if (slowModelTiers.has(parsed.model)) setTimeout(respond, 2500);
+          else respond();
         } catch (err) {
           console.error(`[stub] error handling ${req.url}: ${err.message}`);
           if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
@@ -593,6 +604,216 @@ test("Phase 3: a bot with no model tier falls back to the deployment default", {
     usedTiers.has("stub-model"),
     `expected the deployment default, saw: ${[...usedTiers].join(", ")}`
   );
+});
+
+// --- Phase 5: relay orchestration -------------------------------------------
+//
+// Naming several bots in one message is a relay turn: they answer in sequence,
+// each seeing what the earlier ones said, so the group gets a discussion rather
+// than N unrelated replies.
+
+test("Phase 5: two named bots answer in sequence, the second seeing the first", { skip }, async () => {
+  telegram = [];
+  calls = [];
+  const chatId = 3201;
+  const aliceId = await seedNamedBot(chatId, {
+    ownerUserId: 810,
+    displayName: "Alice",
+    modelTier: "alice:free",
+    relayPosition: 0,
+  });
+  const carolId = await seedNamedBot(chatId, {
+    ownerUserId: 810,
+    displayName: "Carol",
+    modelTier: "carol:free",
+    relayPosition: 1,
+  });
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 500,
+      chatId,
+      fromId: 811,
+      fromName: "Human",
+      text: "@Alice @Carol where should we go in May?",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1 AND bot_id = ANY($2::bigint[])",
+        [chatId, [aliceId, carolId]]
+      );
+      return rows[0].n >= 2;
+    },
+    { label: "both bots answered" }
+  );
+
+  // Two replies, in relay position order, each attributed to its own bot.
+  const texts = sentTexts(chatId);
+  assert.equal(texts.length, 2, `expected two replies, got: ${texts.join(" | ")}`);
+  assert.match(texts[0], /Alice/, "the first reply must be Alice's");
+  assert.match(texts[1], /Carol/, "the second reply must be Carol's");
+
+  // The second bot's prompt must contain the first bot's words - that is what
+  // makes it a discussion rather than two unrelated answers.
+  const carolCall = calls.find((c) => c.body.model === "carol:free");
+  const carolPrompt = carolCall.body.messages.find((m) => m.role === "user").content;
+  assert.match(carolPrompt, /Alice/, "Carol must see that Alice already spoke");
+  assert.match(carolPrompt, /Do not repeat/i);
+
+  // Alice, going first, must NOT have seen a discussion.
+  const aliceCall = calls.find((c) => c.body.model === "alice:free");
+  const alicePrompt = aliceCall.body.messages.find((m) => m.role === "user").content;
+  assert.ok(!/Others have already answered/.test(alicePrompt), "the first bot sees no discussion");
+});
+
+test("Phase 5: a human interjection stops the bots still waiting to speak", { skip }, async () => {
+  telegram = [];
+  const chatId = 3203;
+  // Three bots, and a deliberately slow model so the turn is still in flight
+  // when the human speaks. Without the delay the whole turn finishes first and
+  // the test would pass whether or not cancellation works.
+  const ids = [];
+  for (const [i, name] of ["Q0", "Q1", "Q2"].entries()) {
+    ids.push(
+      await seedNamedBot(chatId, {
+        ownerUserId: 814,
+        displayName: name,
+        modelTier: "slow:free",
+        relayPosition: i,
+      })
+    );
+  }
+  slowModelTiers.add("slow:free");
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 502,
+      chatId,
+      fromId: 815,
+      fromName: "Human",
+      text: "@Q0 @Q1 @Q2 debate this",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // Wait for the first bot to speak, then interject while the rest are pending.
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1",
+        [chatId]
+      );
+      return rows[0].n >= 1;
+    },
+    { label: "first relay bot" }
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 503,
+      chatId,
+      fromId: 815,
+      fromName: "Human",
+      text: "actually never mind, just checking",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // Wait long enough that a turn WITHOUT cancellation would have finished all
+  // three bots (3 x 2.5s slow calls). Waiting only until the first reply lands
+  // would let this test pass while cancellation was entirely broken.
+  await wait(12000);
+
+  const { rows } = await admin.query(
+    "SELECT sender FROM bot_messages WHERE chat_id = $1 ORDER BY id",
+    [chatId]
+  );
+  assert.ok(
+    rows.length < 3,
+    `an interjection must stop the remaining bots, but all spoke: ${rows.map((r) => r.sender).join(", ")}`
+  );
+  assert.equal(rows[0].sender, "Q0", "the bot already speaking keeps its turn");
+});
+
+test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
+  const chatId = 3201;
+  const { rows } = await admin.query(
+    "SELECT bot_id, sender, count(*)::int AS n FROM bot_messages WHERE chat_id = $1 GROUP BY bot_id, sender ORDER BY sender",
+    [chatId]
+  );
+  assert.equal(rows.length, 2, "each bot must have its own row set");
+  for (const row of rows) {
+    assert.equal(row.n, 1, `${row.sender} must hold exactly its own reply`);
+  }
+  // No reply may be recorded against the relay's (chat_id-only) memory.
+  const relayRows = await admin.query(
+    "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+    [chatId]
+  );
+  assert.equal(relayRows.rows[0].n, 1, "only the human's message belongs to the chat transcript");
+});
+
+test("Phase 5: a relay turn is capped at the configured fan-out", { skip }, async () => {
+  telegram = [];
+  calls = [];
+  const chatId = 3202;
+  const names = ["P0", "P1", "P2", "P3", "P4"];
+  const ids = [];
+  for (const [i, name] of names.entries()) {
+    ids.push(
+      await seedNamedBot(chatId, {
+        ownerUserId: 812,
+        displayName: name,
+        modelTier: `${name}:free`,
+        relayPosition: i,
+      })
+    );
+  }
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 501,
+      chatId,
+      fromId: 813,
+      fromName: "Human",
+      text: "@P0 @P1 @P2 @P3 @P4 settle this",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1",
+        [chatId]
+      );
+      return rows[0].n >= 3;
+    },
+    { label: "relay replies" }
+  );
+  // Give any uncapped extra replies time to land before counting.
+  await pump();
+
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1",
+    [chatId]
+  );
+  assert.equal(Number(rows[0].n), 3, `fan-out must be capped at 3, got ${rows[0].n}`);
+
+  // The cap must keep the FIRST bots by relay position, not an arbitrary set.
+  const { rows: spoke } = await admin.query(
+    "SELECT sender FROM bot_messages WHERE chat_id = $1 ORDER BY id",
+    [chatId]
+  );
+  assert.deepEqual(spoke.map((r) => r.sender), ["P0", "P1", "P2"]);
 });
 
 test("Phase 3: an unaddressed group message is not routed to a named bot", { skip }, async () => {
