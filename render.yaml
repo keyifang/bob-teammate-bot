@@ -81,6 +81,18 @@
         {
           "key": "SUMMARY_MAX_TOKENS",
           "value": "4000"
+        },
+        {
+          "key": "RELAY_MAX_BOTS",
+          "value": "3"
+        },
+        {
+          "key": "OVERLOAD_MAX_ATTEMPTS",
+          "value": "5"
+        },
+        {
+          "key": "OVERLOAD_BASE_DELAY_MS",
+          "value": "1500"
         }
       ]
     }

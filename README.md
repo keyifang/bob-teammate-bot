@@ -16,10 +16,68 @@ see [AI disclosure](#ai-disclosure).
 | `config.js` | Persona and summariser prompts, AI-disclosure guarantee |
 | `db.js` | Postgres access; schema bootstrap |
 | `prompt.js` | Assembly of the reply prompt (tiers C, B, A) |
+| `bots.js` | Named-bot routing: who answers, and what text the model sees |
+| `model-config.js` | Which model generates a given reply (per-bot tier, else default) |
+| `relay.js` | Relay sequencing: fan-out cap, discussion context, cancellation |
+| `quota.js` | Plans and per-message caps (search budget, tool hops) |
+| `document.js` | HTML export rendering, incl. escaping |
 | `tools.js` | `owl_research` and `web_fetch`, incl. the SSRF guard |
 | `formatting.js` | Markdown → Telegram HTML, and chunking |
 | `register-webhook.js` | One-shot `setWebhook` + verification |
 | `schema.sql` | Reference schema (the app applies the same DDL on boot) |
+
+## Named bots and the relay
+
+A group can host several named bots. Naming one — `@Alice`, `Alice,`, or
+`Alice:` — routes the message to that bot, which answers as its own persona
+with its own memory (`bot_messages` keyed on `bot_id`) and its own model tier.
+
+Naming several at once starts a **relay turn**: they answer in sequence, each
+seeing what the earlier ones said, so the group gets a discussion rather than N
+unrelated replies. Two properties make this work:
+
+- **The turn is not awaited in the webhook handler.** The handler runs one job
+  per chat in order; awaiting the turn would hold the queue for its whole
+  duration and a human's interjection would sit behind it, unable to cancel
+  anything.
+- **Cancellation is checked before each bot**, so an interjection during the
+  first bot's generation stops the rest rather than racing them.
+
+The relay is the only bot holding a Telegram token. Named bots are personas
+consulted server-side, which is why `bots.telegram_user_id` is nullable.
+
+## Memory isolation
+
+Memory is keyed on `(bot_id, chat_id)`, not on `chat_id` alone, and two
+properties fall out of the key rather than a filtering convention:
+
+- a bot carries what it learned in one group into the next, because
+  `bot_owner_memory` is keyed on `bot_id` alone
+- two owners' bots never mix, because `bot_id → owner_user_id` is a foreign key
+
+## Plans and quotas
+
+A plan bounds capability as well as bot count, because every bot runs on our
+compute and our model key.
+
+| Plan | Bots | Searches / message | Tool hops | Model choice |
+|---|---|---|---|---|
+| free | 1 | 1 | 2 | no |
+| pro | 5 | 5 | 6 | yes |
+| pro_plus | unlimited | 10 | 8 | yes |
+
+A missing subscription is the normal free case, never an error. An **inactive**
+subscription also resolves to free — reading `plan='pro'` off a canceled row
+would grant paid capability to a non-paying user. A bot runs on its **owner's**
+plan, not the sender's, so a guest cannot spend someone else's quota.
+
+## Document export
+
+`/export [title]` renders the last answer as a styled HTML document and sends
+it with `sendDocument`. The reply body is escaped and wrapped in `<pre>`, never
+interpreted as HTML — a reply containing `</html>` or a `<script>` tag cannot
+alter or truncate the document. PDF would need a headless browser or
+`weasyprint` and is deliberately not included.
 
 ## Memory model
 
@@ -143,6 +201,11 @@ Notable coverage:
 - cross-chat isolation is asserted on the prompt actually sent to the model
 - the AI-disclosure tests use a stub that deliberately omits the disclosure, so
   they prove the app enforces it rather than the model
+- `schema.sql` is executed against a real Postgres rather than compared by
+  inspection, because a hand-maintained mirror drifts and a name-only check
+  would not catch a file that does not run
+- the deployment checks read `render.yaml` as JSON, so a syntax error fails
+  locally instead of at deploy time
 
 ## Deployment
 

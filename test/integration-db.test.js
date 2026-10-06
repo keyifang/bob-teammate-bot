@@ -40,6 +40,53 @@ const CHAT = 900000001;
 const ALICE = 700000001;
 const BOB_ID = 700000002;
 
+// schema.sql is a hand-maintained mirror of ensureSchema(), so the real risk is
+// not a wrong table name but a file that does not actually run. This executes
+// it against a scratch database rather than trusting it by inspection.
+test("schema.sql actually executes against a real Postgres", { skip }, async () => {
+  const { readFile } = await import("node:fs/promises");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const HERE = path.dirname(fileURLToPath(import.meta.url));
+  const sql = await readFile(path.join(HERE, "..", "schema.sql"), "utf8");
+
+  const scratchName = "bobdb_schemacheck";
+  const adminUrl = new URL(TEST_DB);
+  const base = `${adminUrl.protocol}//${adminUrl.username}:${adminUrl.password}@${adminUrl.hostname}:${adminUrl.port}/postgres`;
+  const scratchAdmin = new pg.Pool({ connectionString: base });
+  try {
+    await scratchAdmin.query(`DROP DATABASE IF EXISTS ${scratchName}`);
+    await scratchAdmin.query(`CREATE DATABASE ${scratchName}`);
+
+    const scratch = new pg.Pool({
+      connectionString: `${adminUrl.protocol}//${adminUrl.username}:${adminUrl.password}@${adminUrl.hostname}:${adminUrl.port}/${scratchName}`,
+    });
+    try {
+      // Statements are split on semicolons at line ends; the file contains no
+      // function bodies or dollar-quoting, so this is safe here.
+      const statements = sql
+        .split(/;\s*$/m)
+        .map((s) => s.trim())
+        .filter((s) => s && !s.split("\n").every((l) => l.trim().startsWith("--")));
+      for (const statement of statements) {
+        await scratch.query(statement);
+      }
+      const { rows } = await scratch.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+      );
+      const names = rows.map((r) => r.table_name);
+      for (const t of ["bots", "bot_chats", "bot_messages", "bot_summaries", "bot_owner_memory", "subscriptions"]) {
+        assert.ok(names.includes(t), `schema.sql did not create ${t}`);
+      }
+    } finally {
+      await scratch.end();
+    }
+  } finally {
+    await scratchAdmin.query(`DROP DATABASE IF EXISTS ${scratchName}`).catch(() => {});
+    await scratchAdmin.end();
+  }
+});
+
 test("ensureSchema is idempotent", { skip }, async () => {
   await db.ensureSchema();
   await db.ensureSchema();
