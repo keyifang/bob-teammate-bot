@@ -742,6 +742,139 @@ test("Phase 5: a human interjection stops the bots still waiting to speak", { sk
   assert.equal(rows[0].sender, "Q0", "the bot already speaking keeps its turn");
 });
 
+// --- Phase 6: per-bot memory isolation --------------------------------------
+//
+// Requirement 9: a bot carries what it learned in one group into the next.
+// Requirement 10: two owners' bots never mix. Both are consequences of the
+// schema key, so these tests exercise them through the real webhook path.
+
+test("Phase 6: a bot carries its owner memory from one group into another", { skip }, async () => {
+  const chatA = 3301;
+  const chatB = 3302;
+  const botId = await seedNamedBot(chatA, {
+    ownerUserId: 820,
+    displayName: "Remy",
+    modelTier: "remy:free",
+    relayPosition: 0,
+  });
+  // Same bot, linked into a second group it has never spoken in.
+  await admin.query(
+    `INSERT INTO chats (chat_id, title) VALUES ($1, 'Second group')
+     ON CONFLICT (chat_id) DO NOTHING`,
+    [chatB]
+  );
+  await admin.query(
+    `INSERT INTO bot_chats (bot_id, chat_id, relay_position) VALUES ($1, $2, 0)
+     ON CONFLICT (bot_id, chat_id) DO NOTHING`,
+    [botId, chatB]
+  );
+  // Something the bot learned in group A, travelling with the bot (tier C).
+  await admin.query(
+    `INSERT INTO bot_owner_memory (bot_id, summary) VALUES ($1, $2)
+     ON CONFLICT (bot_id) DO UPDATE SET summary = EXCLUDED.summary`,
+    [botId, "OWNER_LIKES_WINDOW_SEATS"]
+  );
+  // And a tier-B summary that must NOT travel - group B has its own history.
+  await admin.query(
+    `INSERT INTO bot_summaries (bot_id, chat_id, summary) VALUES ($1, $2, $3)
+     ON CONFLICT (bot_id, chat_id) DO UPDATE SET summary = EXCLUDED.summary`,
+    [botId, chatA, "GROUP_A_SECRET_PLAN"]
+  );
+
+  calls = [];
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 600,
+      chatId: chatB,
+      fromId: 821,
+      fromName: "Human",
+      text: "@Remy where should we sit?",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        [botId, chatB]
+      );
+      return rows[0].n > 0;
+    },
+    { label: "Remy's reply in group B" }
+  );
+
+  const call = calls.find((c) => c.body.model === "remy:free");
+  const prompt = call.body.messages.find((m) => m.role === "user").content;
+  assert.match(prompt, /OWNER_LIKES_WINDOW_SEATS/, "tier C must travel with the bot");
+  assert.ok(
+    !prompt.includes("GROUP_A_SECRET_PLAN"),
+    "tier B is per chat and must NOT leak into another group"
+  );
+});
+
+test("Phase 6: two owners' bots never see each other's memory", { skip }, async () => {
+  const chatId = 3303;
+  const ownerOneBot = await seedNamedBot(chatId, {
+    ownerUserId: 822,
+    displayName: "One",
+    modelTier: "one:free",
+    relayPosition: 0,
+  });
+  const ownerTwoBot = await seedNamedBot(chatId, {
+    ownerUserId: 823,
+    displayName: "Two",
+    modelTier: "two:free",
+    relayPosition: 1,
+  });
+
+  await admin.query(
+    `INSERT INTO bot_owner_memory (bot_id, summary) VALUES ($1, $2)
+     ON CONFLICT (bot_id) DO UPDATE SET summary = EXCLUDED.summary`,
+    [ownerOneBot, "OWNER_ONE_PRIVATE_FACT"]
+  );
+  await admin.query(
+    `INSERT INTO bot_messages (bot_id, chat_id, sender, text) VALUES ($1, $2, 'One', $3)`,
+    [ownerOneBot, chatId, "ONE_ONLY_HISTORY"]
+  );
+
+  calls = [];
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 601,
+      chatId,
+      fromId: 824,
+      fromName: "Human",
+      text: "@Two what do you think?",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        [ownerTwoBot, chatId]
+      );
+      return rows[0].n > 0;
+    },
+    { label: "bot Two's reply" }
+  );
+
+  const call = calls.find((c) => c.body.model === "two:free");
+  const prompt = call.body.messages.find((m) => m.role === "user").content;
+  assert.ok(
+    !prompt.includes("OWNER_ONE_PRIVATE_FACT"),
+    "another owner's tier C must never reach this bot"
+  );
+  assert.ok(
+    !prompt.includes("ONE_ONLY_HISTORY"),
+    "another bot's transcript must never reach this bot"
+  );
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(
