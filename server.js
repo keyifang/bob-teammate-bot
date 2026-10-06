@@ -38,6 +38,7 @@ import {
   getBotSummary,
   updateBotSummary,
   getBotOwnerMemory,
+  getSubscription,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
@@ -46,6 +47,7 @@ import { routeMessage, stripAddress, isRelay } from "./bots.js";
 import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
 import { renderDocumentHtml, safeFileName } from "./document.js";
+import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -416,11 +418,17 @@ const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
 const HUMANIZE_MAX_CHARS = Number(process.env.HUMANIZE_MAX_CHARS ?? 400);
 const HUMANIZE_SKIP_UNDER = process.env.HUMANIZE_SKIP_UNDER ?? "true";
 
-async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME) {
+async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS.free) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
   ];
+
+  // The plan bounds the work one message may do. Searches are counted across
+  // the whole turn, so a model that searches on every hop cannot exceed its
+  // plan by spreading the calls out.
+  const hopBudget = allowedHops(plan);
+  let searchesUsed = 0;
 
   let data = await modelRequest(chatId, "reply", {
     model,
@@ -437,7 +445,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
   // asking for another tool, the remaining calls are forced to "none" so it
   // has to answer from what it already has - otherwise content comes back null
   // and the user gets nothing at all.
-  while (choice.message.tool_calls && hops < 3) {
+  while (choice.message.tool_calls && hops < hopBudget) {
     messages.push(choice.message);
 
     for (const call of choice.message.tool_calls) {
@@ -449,12 +457,22 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
       } catch {
         args = {};
       }
+
       let result;
-      try {
-        result = await executeTool(call.function.name, args);
-      } catch (err) {
-        result = `Tool failed: ${err.message}`;
-        log(chatId, `tool ${call.function.name} failed: ${err.message}`);
+      const isSearch = call.function.name === "web_search" || call.function.name === "owl_research";
+      if (isSearch && !withinSearchBudget(plan, searchesUsed)) {
+        // Refused rather than executed, and told plainly, so the model answers
+        // from what it has instead of retrying the same search.
+        result = quotaMessage("research", plan);
+        log(chatId, `search refused: plan ${plan.id} allows ${plan.searchesPerMessage} per message`);
+      } else {
+        if (isSearch) searchesUsed++;
+        try {
+          result = await executeTool(call.function.name, args);
+        } catch (err) {
+          result = `Tool failed: ${err.message}`;
+          log(chatId, `tool ${call.function.name} failed: ${err.message}`);
+        }
       }
       messages.push({
         role: "tool",
@@ -463,7 +481,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
       });
     }
 
-    const isFinalHop = hops + 1 >= 3;
+    const isFinalHop = hops + 1 >= hopBudget;
     data = await modelRequest(chatId, `reply hop ${hops + 1}`, {
       model,
       messages,
@@ -542,7 +560,7 @@ async function typingDelay(chatId, replyLength) {
 
 // finalize, when given, is applied to the text about to be sent (used to
 // guarantee Bob's AI disclosure on the first message of a private chat).
-async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME) {
+async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME, plan = PLANS.free) {
   await bot.sendChatAction(chatId, "typing");
   const typingPing = setInterval(
     () => bot.sendChatAction(chatId, "typing").catch(() => {}),
@@ -551,7 +569,7 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
 
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan);
   } catch (err) {
     console.error("Reply generation failed:", err.message);
     // An overloaded free provider is transient and expected on a busy tier;
@@ -575,13 +593,13 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
 // (bot_messages keyed by bot_id), its own model tier, and its own voice, but
 // only the relay posts to Telegram. Returns the text that was sent, or null if
 // nothing was.
-async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = true } = {}) {
+async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = true, plan = PLANS.free } = {}) {
   const model = modelForBot(bot);
   const personaName = bot.display_name;
 
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan);
   } catch (err) {
     console.error(`Reply from ${personaName} failed:`, err.message);
     reply = err?.overloaded ? OVERLOADED_REPLY : FALLBACK_REPLY;
@@ -634,22 +652,22 @@ async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = ""
 // A relay turn: the addressed bots answer in sequence, each seeing what the
 // ones before said. Bounded by planRelay, and abandoned the moment a newer
 // message arrives, so a slow free model cannot block someone chiming in.
-async function runRelayTurn(chatId, senderId, senderName, text, personas) {
-  const plan = planRelay(personas);
+async function runRelayTurn(chatId, senderId, senderName, text, personas, plan = PLANS.free) {
+  const ordered = planRelay(personas);
   const token = relayTurns.begin(chatId);
   const replies = [];
 
-  for (const persona of plan) {
+  for (const persona of ordered) {
     // Checked before each bot, not just at the start: an interjection during
     // the first bot's generation must stop the rest, not race them.
     if (!relayTurns.isCurrent(chatId, token)) {
-      log(chatId, `relay turn superseded after ${replies.length} of ${plan.length}`);
+      log(chatId, `relay turn superseded after ${replies.length} of ${ordered.length}`);
       return replies;
     }
 
     const discussion = buildDiscussionContext(replies);
     const prompt = await buildPersonaPrompt(persona, chatId, senderName, text, discussion);
-    const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt);
+    const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt, { plan });
     replies.push({ name: persona.display_name, text: spoken });
   }
 
@@ -718,6 +736,19 @@ async function summarizeSafely(chatId) {
     await summarizeIfNeeded(chatId);
   } catch (err) {
     console.error("Summarization failed:", err.message);
+  }
+}
+
+// The plan a bot runs under is its OWNER's. A missing row or a billing problem
+// resolves to free, never to an error, so a working bot does not go offline
+// because of a subscription lookup.
+async function planForOwner(ownerUserId) {
+  if (ownerUserId == null) return PLANS.free;
+  try {
+    return resolvePlan(await getSubscription(ownerUserId));
+  } catch (err) {
+    console.error("Subscription lookup failed, defaulting to free:", err.message);
+    return PLANS.free;
   }
 }
 
@@ -901,13 +932,16 @@ async function handleUpdate(update) {
   const personas = route.bots.filter((b) => !isRelay(b, relayTelegramUserId));
   if (personas.length) {
     const cleaned = route.stripName ? stripAddress(text, route.stripName) : text;
+    // A persona runs on its OWNER's plan, not the sender's: the owner pays for
+    // it, and a guest must not be able to spend someone else's quota.
+    const personaPlan = await planForOwner(personas[0].owner_user_id);
 
     // One bot addressed: answer as before. Two or more: it is a relay turn, and
     // the bots answer in sequence seeing each other, rather than posting N
     // unrelated replies.
     if (personas.length === 1) {
       const prompt = await buildPersonaPrompt(personas[0], chatId, senderName, cleaned, "");
-      await sendNamedBotReply(chatId, sender.id, personas[0], prompt);
+      await sendNamedBotReply(chatId, sender.id, personas[0], prompt, { plan: personaPlan });
       summarizeSafely(chatId);
       return;
     }
@@ -916,7 +950,7 @@ async function handleUpdate(update) {
     // awaiting the turn here would hold the queue for its whole duration - and
     // the human's interjection would sit behind it, unable to cancel anything.
     // Starting it detached is what makes chiming in work at all.
-    runRelayTurn(chatId, sender.id, senderName, cleaned, personas).catch((err) =>
+    runRelayTurn(chatId, sender.id, senderName, cleaned, personas, personaPlan).catch((err) =>
       console.error(`Relay turn failed for chat ${chatId}:`, err.message)
     );
     summarizeSafely(chatId);
@@ -963,7 +997,9 @@ async function handleUpdate(update) {
         sender.id,
         userPrompt,
         jumpingIn,
-        claimed ? ensureAiDisclosure : undefined
+        claimed ? ensureAiDisclosure : undefined,
+        MODEL_NAME,
+        await planForOwner(owner?.user_id)
       );
     } catch (err) {
       // A failed reply must still disclose, but must not burn the claim if the

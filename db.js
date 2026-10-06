@@ -120,6 +120,20 @@ const SCHEMA_STATEMENTS = [
     summary TEXT DEFAULT '',
     updated_at TIMESTAMPTZ DEFAULT now()
   )`,
+
+  // --- Phase 8: subscriptions ----------------------------------------------
+  //
+  // One row per paying user. A user with NO row is the normal free case, so
+  // every reader treats "absent" as "free" rather than as an error - a billing
+  // hiccup must not take a working bot offline.
+  `CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    plan TEXT NOT NULL DEFAULT 'free',
+    status TEXT NOT NULL DEFAULT 'active',
+    bot_quota INT,
+    stripe_customer_id TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`,
 ];
 
 // One statement per call. Supabase's pooler runs in transaction mode, which
@@ -442,4 +456,36 @@ export async function updateBotOwnerMemory(botId, summary) {
      DO UPDATE SET summary = EXCLUDED.summary, updated_at = now()`,
     [botId, summary]
   );
+}
+
+// --- Phase 8: subscriptions -------------------------------------------------
+
+export async function getSubscription(userId) {
+  const { rows } = await getPool().query(
+    `SELECT * FROM subscriptions WHERE user_id = $1`,
+    [userId]
+  );
+  return rows[0] ?? null;
+}
+
+export async function setSubscription(userId, { plan, status = "active", botQuota = null, stripeCustomerId = null }) {
+  await getPool().query(
+    `INSERT INTO subscriptions (user_id, plan, status, bot_quota, stripe_customer_id, updated_at)
+     VALUES ($1, $2, $3, $4, $5, now())
+     ON CONFLICT (user_id)
+     DO UPDATE SET plan = EXCLUDED.plan,
+                   status = EXCLUDED.status,
+                   bot_quota = EXCLUDED.bot_quota,
+                   stripe_customer_id = EXCLUDED.stripe_customer_id,
+                   updated_at = now()`,
+    [userId, plan, status, botQuota, stripeCustomerId]
+  );
+}
+
+export async function countBotsForOwner(ownerUserId) {
+  const { rows } = await getPool().query(
+    `SELECT COUNT(*)::int AS count FROM bots WHERE owner_user_id = $1`,
+    [ownerUserId]
+  );
+  return rows[0].count;
 }

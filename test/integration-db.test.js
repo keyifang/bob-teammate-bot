@@ -21,8 +21,9 @@ before(async () => {
   if (!TEST_DB) return;
   admin = new pg.Pool({ connectionString: TEST_DB });
   await admin.query(
-    `DROP TABLE IF EXISTS bot_owner_memory, bot_summaries, bot_messages,
-     bot_chats, bots, messages, chat_participants, chats, users CASCADE`
+    `DROP TABLE IF EXISTS subscriptions, bot_owner_memory, bot_summaries,
+     bot_messages, bot_chats, bots, messages, chat_participants, chats,
+     users CASCADE`
   );
   // db.js reads DATABASE_URL at import time, so set it before importing.
   process.env.DATABASE_URL = TEST_DB;
@@ -371,6 +372,41 @@ test("getBotsForChat returns every relay participant in position order", { skip 
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
   assert.ok(bots.length >= 3, `expected the linked bots, got ${bots.length}`);
   assert.ok(bots.every((b) => b.display_name), "each row must carry its display name");
+});
+
+// Phase 8: subscriptions. Billing state is stored, and a missing row is a
+// valid state meaning "free" - never an error, because a billing hiccup must
+// not take a working bot offline.
+test("a subscription round-trips and defaults to no subscription", { skip }, async () => {
+  assert.equal(await db.getSubscription(OWNER_1), null, "no row means free, not an error");
+
+  await db.setSubscription(OWNER_1, { plan: "pro", status: "active", botQuota: 5 });
+  const sub = await db.getSubscription(OWNER_1);
+  assert.equal(sub.plan, "pro");
+  assert.equal(sub.status, "active");
+  assert.equal(Number(sub.bot_quota), 5);
+
+  // Upsert, not insert: a plan change must update in place.
+  await db.setSubscription(OWNER_1, { plan: "free", status: "canceled" });
+  const changed = await db.getSubscription(OWNER_1);
+  assert.equal(changed.plan, "free");
+  assert.equal(changed.status, "canceled");
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM subscriptions WHERE user_id = $1",
+    [OWNER_1]
+  );
+  assert.equal(rows[0].n, 1, "a plan change must not create a second row");
+});
+
+test("counting a user's bots ignores other users' and persona rows", { skip }, async () => {
+  const { rows } = await admin.query(
+    "SELECT owner_user_id, count(*)::int AS n FROM bots GROUP BY owner_user_id"
+  );
+  for (const row of rows) {
+    const counted = await db.countBotsForOwner(row.owner_user_id);
+    assert.equal(counted, row.n, `owner ${row.owner_user_id} count must match`);
+  }
+  assert.equal(await db.countBotsForOwner(999999999), 0, "an unknown owner owns nothing");
 });
 
 // In the relay architecture the named bots are personas consulted server-side,

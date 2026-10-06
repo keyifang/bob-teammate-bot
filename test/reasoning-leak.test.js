@@ -151,5 +151,9 @@ test("the final tool hop forces an answer instead of allowing an endless chain",
   // Without this, a model that keeps requesting tools returns null content and
   // the user sees nothing.
   assert.match(src, /tool_choice: isFinalHop \? "none" : "auto"/);
-  assert.match(src, /isFinalHop = hops \+ 1 >= 3/);
+  // The budget is now the plan's (allowedHops), not a bare 3 - but the loop
+  // must still stop at it, and the last hop must still be the forced one.
+  assert.match(src, /const hopBudget = allowedHops\(plan\)/);
+  assert.match(src, /while \(choice\.message\.tool_calls && hops < hopBudget\)/);
+  assert.match(src, /isFinalHop = hops \+ 1 >= hopBudget/);
 });

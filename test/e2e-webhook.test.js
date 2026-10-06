@@ -105,9 +105,44 @@ function startStub() {
             );
           };
 
+          // A "searchy" model asks for TWO searches in parallel on its first
+          // turn, then answers. Two parallel calls in one hop is the case that
+          // exercises the per-message search budget, and stopping after the
+          // first hop keeps the test from running a dozen real searches.
+          const alreadySearched = (parsed.messages ?? []).some((m) => m.role === "tool");
+          const wantsSearch =
+            parsed.model?.startsWith("searchy") &&
+            parsed.tool_choice !== "none" &&
+            !alreadySearched;
+          const respondWithSearch = () => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: null,
+                      tool_calls: [1, 2].map((n) => ({
+                        id: `call_${n}`,
+                        type: "function",
+                        function: {
+                          name: "web_search",
+                          arguments: JSON.stringify({ query: `stub query ${n}` }),
+                        },
+                      })),
+                    },
+                  },
+                ],
+                usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+              })
+            );
+          };
+
           // A tier registered as slow answers after a delay, so a relay turn is
           // still in flight when the test injects a human message.
           if (slowModelTiers.has(parsed.model)) setTimeout(respond, 2500);
+          else if (wantsSearch) respondWithSearch();
           else respond();
         } catch (err) {
           console.error(`[stub] error handling ${req.url}: ${err.message}`);
@@ -210,8 +245,9 @@ before(async () => {
 
   admin = new pg.Pool({ connectionString: TEST_DB });
   await admin.query(
-    `DROP TABLE IF EXISTS bot_owner_memory, bot_summaries, bot_messages,
-     bot_chats, bots, messages, chat_participants, chats, users CASCADE`
+    `DROP TABLE IF EXISTS subscriptions, bot_owner_memory, bot_summaries,
+     bot_messages, bot_chats, bots, messages, chat_participants, chats,
+     users CASCADE`
   );
 
   const uiBase = `http://127.0.0.1:${stubPort}`;
@@ -950,6 +986,131 @@ test("Phase 7: /export with nothing to export says so instead of failing", { ski
     "no document may be sent when there is nothing to export"
   );
   assert.match(sentTexts(chatId)[0], /nothing to export/i);
+});
+
+// --- Phase 8: quotas --------------------------------------------------------
+
+test("Phase 8: a free-plan bot cannot exceed its search budget in one message", { skip }, async () => {
+  const chatId = 3501;
+  // The model asks for TWO searches in parallel every hop. Free allows ONE
+  // search per message, so the second must be refused - and because the
+  // refusal is counted, the cap holds no matter how the calls are spread.
+  await seedNamedBot(chatId, {
+    ownerUserId: 840,
+    displayName: "Searcher",
+    modelTier: "searchy-free",
+    relayPosition: 0,
+  });
+
+  const logStart = serverLog.length;
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 800,
+      chatId,
+      fromId: 841,
+      fromName: "Human",
+      text: "@Searcher look this up",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // Wait for the actual reply, not a log line: the refusal is logged after the
+  // first search runs, so waiting on "reply tokens" reads the log too early.
+  // The search itself is a real network call, so the wait is generous.
+  await waitFor(() => sentTo(chatId).length > 0, {
+    label: "a reply despite the refused search",
+    timeout: 30000,
+  });
+
+  const lines = serverLog.slice(logStart).join("\n");
+  const refused = (lines.match(/search refused/g) ?? []).length;
+  assert.ok(refused >= 1, `a free plan must refuse the over-budget search:\n${lines}`);
+});
+
+test("Phase 8: a pro-plan bot gets a larger search budget", { skip }, async () => {
+  const chatId = 3502;
+  const ownerId = 842;
+  await seedNamedBot(chatId, {
+    ownerUserId: ownerId,
+    displayName: "ProSearch",
+    modelTier: "searchy-pro",
+    relayPosition: 0,
+  });
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Pro Owner')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [ownerId]
+  );
+  await admin.query(
+    `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')
+     ON CONFLICT (user_id) DO UPDATE SET plan = 'pro', status = 'active'`,
+    [ownerId]
+  );
+
+  const logStart = serverLog.length;
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 801,
+      chatId,
+      fromId: 843,
+      fromName: "Human",
+      text: "@ProSearch look this up",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a reply", timeout: 30000 });
+
+  // Pro allows 5 searches, and the stub asks for 2 per hop over up to 6 hops,
+  // so the first hop's two searches both run - unlike free, where the second is
+  // refused.
+  const lines = serverLog.slice(logStart).join("\n");
+  const executed = (lines.match(/tool call: web_search/g) ?? []).length;
+  const refused = (lines.match(/search refused/g) ?? []).length;
+  assert.ok(executed >= 2, `a pro plan must allow the second search:\n${lines}`);
+  assert.equal(refused, 0, `pro must not refuse within its budget:\n${lines}`);
+});
+
+test("Phase 8: a canceled subscription behaves as free, not as paid", { skip }, async () => {
+  const chatId = 3503;
+  const ownerId = 844;
+  await seedNamedBot(chatId, {
+    ownerUserId: ownerId,
+    displayName: "Lapsed",
+    modelTier: "searchy-lapsed",
+    relayPosition: 0,
+  });
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Lapsed Owner')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [ownerId]
+  );
+  // A pro plan that is no longer active. This is the case a naive lookup gets
+  // wrong: it reads plan='pro' and grants paid capability to a canceled user.
+  await admin.query(
+    `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'canceled')
+     ON CONFLICT (user_id) DO UPDATE SET plan = 'pro', status = 'canceled'`,
+    [ownerId]
+  );
+
+  const logStart = serverLog.length;
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 802,
+      chatId,
+      fromId: 845,
+      fromName: "Human",
+      text: "@Lapsed look this up",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a reply", timeout: 30000 });
+
+  const lines = serverLog.slice(logStart).join("\n");
+  assert.match(lines, /search refused/, `a canceled plan must fall back to free:\n${lines}`);
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {

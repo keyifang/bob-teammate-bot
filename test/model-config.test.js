@@ -65,8 +65,8 @@ test("the reply path takes a model rather than hardcoding the global", async () 
 
   assert.match(
     src,
-    /async function callModelWithTools\(chatId, systemPrompt, userPrompt, model = MODEL_NAME\)/,
-    "callModelWithTools must accept the model to use"
+    /async function callModelWithTools\(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS\.free\)/,
+    "callModelWithTools must accept the model to use, and the plan that bounds it"
   );
   assert.match(
     src,
@@ -75,8 +75,8 @@ test("the reply path takes a model rather than hardcoding the global", async () 
   );
   assert.match(
     src,
-    /async function sendBobReply\(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME\)/,
-    "sendBobReply must thread a model through"
+    /async function sendBobReply\(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME, plan = PLANS\.free\)/,
+    "sendBobReply must thread a model and a plan through"
   );
 
   // callModelWithTools must use the passed model, not the constant. Asserting
