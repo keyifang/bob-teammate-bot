@@ -56,7 +56,10 @@ function startStub() {
           // its body form-encoded (application/x-www-form-urlencoded), not JSON.
           if (req.url.startsWith("/bot")) {
             const params = Object.fromEntries(new URLSearchParams(body));
-            telegram.push({ url: req.url, body: params });
+            // sendDocument with a Buffer is multipart/form-data, which
+            // URLSearchParams cannot parse. The raw body is kept so those calls
+            // can still be asserted on.
+            telegram.push({ url: req.url, body: params, raw: body });
             res.writeHead(200, { "Content-Type": "application/json" });
             // getMe must return a real identity: the relay learns its own
             // telegram id from it, and routing excludes the relay by that id.
@@ -873,6 +876,80 @@ test("Phase 6: two owners' bots never see each other's memory", { skip }, async 
     !prompt.includes("ONE_ONLY_HISTORY"),
     "another bot's transcript must never reach this bot"
   );
+});
+
+// --- Phase 7: HTML document export ------------------------------------------
+
+test("Phase 7: /export sends the last answer as an HTML document", { skip }, async () => {
+  telegram = [];
+  const chatId = 3401;
+
+  // A prior answer to export.
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 700,
+      chatId,
+      fromId: 830,
+      fromName: "Human",
+      text: `@${BOT_USERNAME} give me a packing list`,
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an answer to export" });
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 701,
+      chatId,
+      fromId: 830,
+      fromName: "Human",
+      text: "/export Packing list",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(
+    () => telegram.some((t) => /sendDocument/.test(t.url)),
+    { label: "document send" }
+  );
+
+  const doc = telegram.find((t) => /sendDocument/.test(t.url));
+  // node-telegram-bot-api puts chat_id and caption in the QUERY STRING and only
+  // the file bytes in the multipart body - verified by probing the real library
+  // rather than assumed, since the first version of this test got it wrong.
+  assert.match(doc.url, /[?&]chat_id=3401(&|$)/, "must target the right chat");
+  assert.match(decodeURIComponent(doc.url), /caption=.*Packing list/, "the title must reach the caption");
+  assert.match(doc.raw, /filename="[^"]*\.html"/, "the file must carry an .html extension");
+  assert.match(doc.raw, /Content-Type: text\/html/, "the file must be declared as HTML");
+  // The document body is the HTML itself, so a real file was uploaded.
+  assert.match(doc.raw, /<!DOCTYPE html>/);
+});
+
+test("Phase 7: /export with nothing to export says so instead of failing", { skip }, async () => {
+  telegram = [];
+  const chatId = 3402;
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 702,
+      chatId,
+      fromId: 831,
+      fromName: "Human",
+      text: "/export",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an explanation" });
+  assert.equal(
+    telegram.filter((t) => /sendDocument/.test(t.url)).length,
+    0,
+    "no document may be sent when there is nothing to export"
+  );
+  assert.match(sentTexts(chatId)[0], /nothing to export/i);
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {

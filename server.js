@@ -45,6 +45,7 @@ import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay } from "./bots.js";
 import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
+import { renderDocumentHtml, safeFileName } from "./document.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -744,6 +745,42 @@ function isAddressedToBob(msg, text) {
   return isBotUsername(msg.reply_to_message?.from?.username);
 }
 
+// `/export [title]` renders the last answer as a document and sends it.
+// sendDocument accepts bytes, so no public host is required.
+async function handleExport(msg, chatId, text, sender) {
+  const match = text.match(/^\/export(?:@\w+)?\s*(.*)$/i);
+  if (!match) return false;
+
+  const recent = await getRecentMessages(chatId, 20);
+  // The most recent thing Bob said is what a user means by "export this".
+  const lastBot = [...recent].reverse().find((m) => m.sender === BOB_NAME);
+  if (!lastBot) {
+    await sendFormatted(chatId, "Nothing to export yet - ask me something first.");
+    return true;
+  }
+
+  const requestedTitle = match[1].trim();
+  const title = requestedTitle || `Bob notes - ${(await getChatTitle(chatId)) || "chat"}`;
+  const html = renderDocumentHtml({
+    title,
+    body: lastBot.text,
+    source: await getChatTitle(chatId),
+  });
+
+  try {
+    await bot.sendDocument(
+      chatId,
+      Buffer.from(html, "utf8"),
+      { caption: `Here's "${title}" as a document.` },
+      { filename: safeFileName(title), contentType: "text/html" }
+    );
+  } catch (err) {
+    console.error("Document send failed:", err.message);
+    await sendFormatted(chatId, "Couldn't send that document - try again?");
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Update handling
 // ---------------------------------------------------------------------------
@@ -840,6 +877,13 @@ async function handleUpdate(update) {
   // always interject instead of waiting for a slow model. If this message is
   // itself a relay turn, runRelayTurn begins a newer one on top of this.
   relayTurns.cancel(chatId);
+
+  // A command is handled before routing, so "/export" is never mistaken for a
+  // message addressed to a bot.
+  if (await handleExport(msg, chatId, text, sender)) {
+    summarizeSafely(chatId);
+    return;
+  }
 
   // Named bots: a message that names one is answered by that bot as its own
   // persona - its own memory, its own model tier, its own voice. routeMessage
