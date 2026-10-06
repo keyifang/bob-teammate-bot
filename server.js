@@ -347,9 +347,9 @@ function contentOf(data, { requireSubstance = false } = {}) {
 
 // One retry for a degenerate reply. Kept separate from the tool loop so a
 // truncation mid-chain is retried with the same message history.
-async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0) {
+async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0, model = MODEL_NAME) {
   const data = await modelRequest(chatId, label, {
-    model: MODEL_NAME,
+    model,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
@@ -362,7 +362,7 @@ async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX
   } catch (err) {
     if (attempt >= 1) throw err;
     log(chatId, `${label} truncated, retrying once: ${err.message}`);
-    return callModel(chatId, systemPrompt, userPrompt, maxTokens, label, attempt + 1);
+    return callModel(chatId, systemPrompt, userPrompt, maxTokens, label, attempt + 1, model);
   }
 }
 
@@ -379,14 +379,14 @@ const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
 const HUMANIZE_MAX_CHARS = Number(process.env.HUMANIZE_MAX_CHARS ?? 400);
 const HUMANIZE_SKIP_UNDER = process.env.HUMANIZE_SKIP_UNDER ?? "true";
 
-async function callModelWithTools(chatId, systemPrompt, userPrompt) {
+async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
   ];
 
   let data = await modelRequest(chatId, "reply", {
-    model: MODEL_NAME,
+    model,
     messages,
     tools: TOOL_SCHEMAS,
     tool_choice: "auto",
@@ -428,7 +428,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
 
     const isFinalHop = hops + 1 >= 3;
     data = await modelRequest(chatId, `reply hop ${hops + 1}`, {
-      model: MODEL_NAME,
+      model,
       messages,
       tools: TOOL_SCHEMAS,
       // On the last permitted hop the model must produce an answer. A model
@@ -449,7 +449,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt) {
 // that measured ~35s and ~1800 reasoning tokens to reword a single sentence -
 // often more than the reply itself. It is skipped for text that is already
 // short and conversational, which is the common case for a chat reply.
-async function humanize(chatId, text) {
+async function humanize(chatId, text, model = MODEL_NAME) {
   if (HUMANIZE !== "true") return text;
   // Skip the extra call for replies already short enough to be in the persona's
   // casual register. HUMANIZE_SKIP_UNDER is opt-out, so setting it to false
@@ -458,7 +458,7 @@ async function humanize(chatId, text) {
     return text;
   }
   try {
-    return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer");
+    return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer", 0, model);
   } catch (err) {
     console.error("Humanizer failed, using raw text:", err.message);
     return text;
@@ -505,7 +505,7 @@ async function typingDelay(chatId, replyLength) {
 
 // finalize, when given, is applied to the text about to be sent (used to
 // guarantee Bob's AI disclosure on the first message of a private chat).
-async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize) {
+async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME) {
   await bot.sendChatAction(chatId, "typing");
   const typingPing = setInterval(
     () => bot.sendChatAction(chatId, "typing").catch(() => {}),
@@ -514,7 +514,7 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
 
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model);
   } catch (err) {
     console.error("Reply generation failed:", err.message);
     // An overloaded free provider is transient and expected on a busy tier;
@@ -526,8 +526,8 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
   }
 
   const finalText = finalize
-    ? finalize(await humanize(chatId, reply))
-    : await humanize(chatId, reply);
+    ? finalize(await humanize(chatId, reply, model))
+    : await humanize(chatId, reply, model);
   await sendFormatted(chatId, finalText);
 
   await insertMessage(chatId, senderId, BOB_NAME, finalText);
