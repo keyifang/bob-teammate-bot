@@ -55,6 +55,12 @@ const KEEP_LAST = Number(RECENT_MESSAGE_WINDOW ?? 20);
 const TRIGGER_AT = KEEP_LAST + Number(SUMMARY_TRIGGER_BUFFER ?? 20);
 const COOLDOWN_MS = Number(UNSOLICITED_COOLDOWN_MS ?? 45000);
 const TELEGRAM_MAX = 4096;
+// Shown when the free provider is saturated after every retry. Distinct from
+// FALLBACK_REPLY because the request itself was fine - retrying is the right
+// user action, and saying "hit an error" invites them to rephrase instead.
+const OVERLOADED_REPLY =
+  "The free model is slammed right now - every retry got through to a busy server. Give it a minute and ask again, it isnt your question thats the problem.";
+
 const FALLBACK_REPLY =
   "Hmm, hit an error looking into that - try asking again?";
 const SEEN_UPDATE_LIMIT = 500;
@@ -135,36 +141,133 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS ?? 300000);
 // case, and silence is indistinguishable from a hang.
 const SLOW_CALL_MS = Number(process.env.SLOW_CALL_MS ?? 30000);
 
+// Free-tier capacity errors, measured at ~60% of requests on
+// nvidia/nemotron-3-ultra-550b-a55b:free:
+//   {"error":{"message":"Upstream error from Nvidia: Service temporarily
+//     overloaded","code":503,"metadata":{"error_type":"provider_overloaded"}}}
+// A tool-using turn is several requests, so without a retry the user sees a
+// failure most of the time. These are transient, so they are retried with
+// jittered backoff rather than surfaced.
+const OVERLOAD_MAX_ATTEMPTS = Number(process.env.OVERLOAD_MAX_ATTEMPTS ?? 4);
+const OVERLOAD_BASE_DELAY_MS = Number(process.env.OVERLOAD_BASE_DELAY_MS ?? 1500);
+const OVERLOAD_MAX_DELAY_MS = Number(process.env.OVERLOAD_MAX_DELAY_MS ?? 20000);
+const OVERLOAD_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+// Distinct from a generic failure so the caller can tell "the free tier is
+// busy" from "the request was malformed" - the user-facing message differs,
+// and only one of them is worth retrying later.
+class OverloadedError extends Error {
+  constructor(detail) {
+    super(
+      detail
+        ? `The model provider is overloaded (${detail}).`
+        : "The model provider is overloaded."
+    );
+    this.name = "OverloadedError";
+    this.overloaded = true;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isOverload(status, bodyText) {
+  if (OVERLOAD_STATUSES.has(status)) return true;
+  return /provider_overloaded|temporarily overloaded|rate.?limit|overloaded/i.test(
+    bodyText ?? ""
+  );
+}
+
+// Full jitter: every client retrying in lockstep after a shared outage is what
+// keeps the provider overloaded in the first place.
+function overloadDelay(attempt) {
+  const ceiling = Math.min(OVERLOAD_BASE_DELAY_MS * 2 ** attempt, OVERLOAD_MAX_DELAY_MS);
+  return Math.floor(Math.random() * ceiling);
+}
+
 async function modelRequest(chatId, label, payload) {
   const startedAt = Date.now();
-  const res = await fetch(MODEL_API_URL, {
-    method: "POST",
-    headers: modelHeaders(),
-    body: JSON.stringify(payload),
-    // A free-tier model queues unpredictably and thinks at length, so the wait
-    // is bounded generously rather than tightly. Aborting early means the user
-    // gets the fallback message instead of an answer.
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    throw new Error(`Model error: ${res.status} ${await res.text()}`);
+  let lastOverload = null;
+
+  for (let attempt = 0; attempt < OVERLOAD_MAX_ATTEMPTS; attempt++) {
+    let res;
+    try {
+      res = await fetch(MODEL_API_URL, {
+        method: "POST",
+        headers: modelHeaders(),
+        body: JSON.stringify(payload),
+        // A free-tier model queues unpredictably and thinks at length, so the
+        // wait is bounded generously rather than tightly. Aborting early means
+        // the user gets the fallback message instead of an answer.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // A dropped connection on a saturated free tier is the same problem as a
+      // 503, and retrying it is correct for the same reason.
+      if (attempt < OVERLOAD_MAX_ATTEMPTS - 1) {
+        const delay = overloadDelay(attempt);
+        log(chatId, `${label} network error (${err.message}), retrying in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      throw new Error(`Model request failed: ${err.message}`);
+    }
+
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      if (isOverload(res.status, bodyText)) {
+        lastOverload = `${res.status}`;
+        if (attempt < OVERLOAD_MAX_ATTEMPTS - 1) {
+          const delay = overloadDelay(attempt);
+          log(chatId, `${label} overloaded (${res.status}), retrying in ${delay}ms`);
+          await sleep(delay);
+          continue;
+        }
+        throw new OverloadedError();
+      }
+      throw new Error(`Model error: ${res.status} ${bodyText.slice(0, 300)}`);
+    }
+
+    const data = await res.json();
+    // OpenRouter can answer 200 with an error object and no choices.
+    if (!Array.isArray(data?.choices) || data.choices.length === 0) {
+      const text = JSON.stringify(data?.error ?? data);
+      if (isOverload(200, text)) {
+        lastOverload = "200-with-error";
+        if (attempt < OVERLOAD_MAX_ATTEMPTS - 1) {
+          const delay = overloadDelay(attempt);
+          log(chatId, `${label} returned no choices (${text.slice(0, 80)}), retrying in ${delay}ms`);
+          await sleep(delay);
+          continue;
+        }
+        throw new OverloadedError();
+      }
+      if (looksLikeReasoningLeak(text)) {
+        // Not an overload: a degenerate 200. Let the caller retry it as usual.
+        return data;
+      }
+      throw new Error(`Model returned no choices: ${text.slice(0, 200)}`);
+    }
+
+    logUsage(chatId, label, data);
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > SLOW_CALL_MS) {
+      log(chatId, `${label} was slow: ${(elapsed / 1000).toFixed(1)}s`);
+    }
+    // Move any scratchpad the provider put in `content` back into `reasoning`,
+    // so the reply is only ever the answer. Sending it would post the model's
+    // internal monologue - and the system prompt - into a group chat.
+    const message = data?.choices?.[0]?.message;
+    if (message && typeof message.content === "string" && looksLikeReasoningLeak(message.content)) {
+      console.error(`${label}: provider put the scratchpad in content; moving it to reasoning`);
+      message.reasoning = [message.reasoning, message.content].filter(Boolean).join("\n");
+      message.content = null;
+    }
+    return data;
   }
-  const data = await res.json();
-  logUsage(chatId, label, data);
-  const elapsed = Date.now() - startedAt;
-  if (elapsed > SLOW_CALL_MS) {
-    log(chatId, `${label} was slow: ${(elapsed / 1000).toFixed(1)}s`);
-  }
-  // Move any scratchpad the provider put in `content` back into `reasoning`,
-  // so the reply is only ever the answer. Sending it would post the model's
-  // internal monologue - and the system prompt - into a group chat.
-  const message = data?.choices?.[0]?.message;
-  if (message && typeof message.content === "string" && looksLikeReasoningLeak(message.content)) {
-    console.error(`${label}: provider put the scratchpad in content; moving it to reasoning`);
-    message.reasoning = [message.reasoning, message.content].filter(Boolean).join("\n");
-    message.content = null;
-  }
-  return data;
+
+  // Unreachable: every path either returns or throws. Kept so a future edit
+  // that falls through fails loudly rather than silently returning undefined.
+  throw new OverloadedError(lastOverload);
 }
 
 // A free-tier generation can come back truncated mid-thought - a 4-character
@@ -414,7 +517,10 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
     reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt);
   } catch (err) {
     console.error("Reply generation failed:", err.message);
-    reply = FALLBACK_REPLY;
+    // An overloaded free provider is transient and expected on a busy tier;
+    // saying so is more useful than a generic "try asking again", because the
+    // user knows the question was fine and should simply retry.
+    reply = err?.overloaded ? OVERLOADED_REPLY : FALLBACK_REPLY;
   } finally {
     clearInterval(typingPing);
   }

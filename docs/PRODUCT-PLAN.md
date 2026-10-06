@@ -54,30 +54,47 @@ which a single-bot competitor cannot replicate overnight.
 
 **Decision needed from you:** relay (recommended) or drop bot-to-bot.
 
-### 2.2 Requirement 1's model cannot use tools
+### 2.2 Requirement 1's model — corrected
 
-`nemotron-3-ultra-550b-a55b:free` advertises `tools` support, and does emit a
-tool call — but as **plain text**, not as a structured call:
+**I got this wrong in the first draft of this plan, and the correction matters.**
+
+I originally wrote that `nemotron-3-ultra-550b-a55b:free` "emits tool calls as
+literal text". Sampling 8 runs says otherwise:
 
 ```
-"<tool_call>\n<function=web_fetch>\n<parameter=url>\nhttps://www.engadget.com/gaming/..."
+SUMMARY of 8: structured=3  textToolCall=0  plain=0  empty=5
 ```
 
-Reproduced twice. `finish_reason: stop`, 221 chars of markup.
+**It emits properly structured tool calls. The text-emission I saw came from
+`openrouter/free`**, which routed to a different model on that call — not from
+nemotron-ultra. I attributed a random router's behaviour to a named model.
 
-Left alone, Bob would post that literal `<tool_call>` markup into your group.
+The 5 "empty" results were not the model failing to emit a call. The raw
+response explains them:
 
-So: **it can be a Bob, but not a Bob with research.** Two options:
+```
+{"error":{"message":"Upstream error from Nvidia: Service temporarily overloaded",
+          "code":503,"metadata":{"error_type":"provider_overloaded"}}}
+```
 
-- **(a) Keep it, disable tools for it.** Fast (2.2s), reliable for
-  conversation and for answering from memory. No live facts.
-- **(b) Keep tools, add a text-tool-call parser.** We already parse tool calls;
-  extend the parser to recognise this markup. ~2 days, and fragile — it is a
-  model bug we would be compensating for.
+So the real constraint is **not** "this model can't use tools". It is:
 
-**Recommendation:** ship it as **"Bob Chat"** (option a) and keep the current
-lightning model as **"Bob Research"**. Two personalities, two tiers of value —
-and it maps neatly onto your pricing ladder.
+> **The free tier drops roughly 60% of requests with a 503 "provider
+> overloaded".** A tool-using turn is 2+ requests, so the chance of at least
+> one 503 on a research question is high.
+
+This is a *retry* problem, not a capability problem — which is the good news.
+The existing code already retries degenerate output; it does not yet retry 503s.
+
+**Actions:**
+1. Retry 503 / `provider_overloaded` with backoff (3 attempts, jittered)
+2. Count consecutive 503s; after N, surface "the free model is overloaded, try
+   again" rather than failing silently
+3. Track success rate per model in the log, so tier choice is evidence-based
+
+Verified: `openrouter/free` produced a clean structured call in the same test
+(`finish_reason: tool_calls`, valid arguments, with reasoning in the proper
+field).
 
 ### 2.3 "Get lucky" is real, and that is fine
 
@@ -323,37 +340,77 @@ to iterate.
 
 ---
 
-## 7. Build order
+## 7. Agreed decisions (2026-10-07)
 
-Sequenced so each step is independently shippable and testable.
+| # | Decision | Rationale |
+|---|---|---|
+| 1 | **Relay orchestration** — bots discuss server-side; user addresses them by name | Bot API forbids bot-to-bot. A relay keeps the UX and the moat. |
+| 2 | **Every bot keeps tools**, on `nemotron-3-ultra-550b-a55b:free` for the POC | Free tiers will improve; correctness of the tools layer matters more than speed now. |
+| 3 | **$1/bot/month** stays | Cost floor collapses as free models improve. Caps still needed as abuse protection. |
+| 4 | **HTML/PDF export** from a group message | New capability; see 7.2. |
 
-| # | Phase | Why here | Est |
-|---|---|---|---|
-| 0 | **Schema: bot-scoped tables** | Everything multi-bot depends on it. Doing it later is a migration. | 2–3d |
-| 1 | **Bot identity: model as per-bot config** | Removes `MODEL_NAME` global. Small, unblocks model choice. | 1d |
-| 2 | **Two named tiers: Chat + Research** | Ships requirement 1&2 as user value now, on current schema | 2d |
-| 3 | **Freshness + sufficiency persona** | Requirements 3–5. Pure prompt work, biggest perceived-intelligence win. | 1d |
-| 4 | **Progressive probing** | Requirement 4. Cheap to add, drives conversion. | 1d |
-| 5 | **Multi-bot in a chat (relay)** | Requirement 8. The hard one — needs 0. | 5–7d |
-| 6 | **Per-bot memory isolation** | Requirements 9,10. Mostly schema; verifies the key. | 2d |
-| 7 | **Subscriptions + quotas** | Requirement 11. Cannot bill before caps exist. | 4–6d |
-| 8 | **Supabase + Render** | Requirement 7 | 1–2d |
+### 7.1 Relay design (decision 1)
 
-Total ~4–5 weeks. Phases 0–4 are ~1 week and produce something genuinely
-demoable and sellable.
+User-facing shape:
+
+```
+KY: @alice what do you think? @bob disagree?
+  → relay: alice and bob discuss server-side (user sees "Alice and Bob are
+    thinking..." with a live indicator)
+  → one consolidated message posts to the group, attributed per paragraph
+  → user can interject at any time; the interjection is folded into the
+    in-flight relay turn
+```
+
+Implementation consequences:
+
+- **A relay turn is not a Telegram message.** It is our own orchestration
+  record, so we control latency and can stream progress.
+- **Chim-in must not be blocked.** The relay keeps reading the chat while the
+  bots discuss; a new human message cancels or redirects the turn.
+- **Long tail is the UX risk.** N bots × slow free model = minutes. Mitigation:
+  publish a partial answer as soon as the first bot answers, then append.
+  Do not wait for consensus.
+- **Cost multiplies with N.** Cap relay fan-out at 3 bots for the POC.
+
+### 7.2 HTML/PDF export (decision 4)
+
+Telegram can deliver a document. `sendDocument` accepts bytes, so no public
+host is required.
+
+```
+bot renders answer → HTML → weasyprint/playwright → PDF
+                  → upload to Telegram → post as a document
+```
+
+**Unverified:** I have not tested HTML→PDF on this machine. It needs either a
+headless Chromium (~150MB — the same dependency `ddgs` in Node avoided) or
+`weasyprint` (Python, lighter). **Recommendation: generate a styled HTML
+document first** (no dependency, useful on its own, readable on a phone), and
+add PDF only once the HTML path is proven and someone actually asks for it.
 
 ---
 
-## 8. What I recommend we do next
+## 8. Build order
 
-Three decisions I need from you, then I start on Phase 0:
+Sequenced so each phase ships independently. Phases 0-4 are the demoable POC.
 
-1. **Bot-to-bot: relay or drop?** The platform forbids direct bot-to-bot.
-   My recommendation is relay — it keeps your differentiator.
-2. **Model tiers: is my split right?** Bob Chat (fast, no tools) vs Bob
-   Research (tools, grounded) — or do you want every bot to keep tools?
-3. **Pricing: accept tiering over flat $1/bot?** Flat per-bot pricing has a
-   cost problem I cannot solve with the current free-model latency.
+| # | Phase | Ships | Est |
+|---|---|---|---|
+| **0** | **503/overload retry with backoff** | Unblocks the chosen free model. Without it ~60% of requests die. | 0.5d |
+| **1** | **Bot-scoped schema** | `bots`, `bot_chats`, `bot_messages`, `bot_summaries`, `bot_owner_memory` | 2-3d |
+| **2** | **Per-bot model config** | Removes the `MODEL_NAME` global; each bot picks its own tier | 1d |
+| **3** | **Named bots in a chat** | `/addbot name`; a bot answers when called by name | 2d |
+| **4** | **Freshness + sufficiency persona** | Requirements 3-5. Pure prompt work, biggest perceived win | 1d |
+| **5** | **Relay orchestration** | Bots discuss server-side; one consolidated post; user can interject | 5-7d |
+| **6** | **Per-bot memory isolation** | Requirements 9,10 — verifies the Phase 1 key | 2d |
+| **7** | **HTML document export** | Decision 4, HTML only first | 2d |
+| **8** | **Subscriptions + quotas** | Decision 3, $1/bot with caps as abuse protection | 4-6d |
+| **9** | **Supabase + Render** | Requirement 7 | 1-2d |
+
+**Phase 0 first because it is a day of work that unblocks everything else.** At a
+~60% failure rate the POC is not demoable, and no other phase can be verified
+without reliable model calls.
 
 ---
 
