@@ -60,6 +60,62 @@ const SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_messages_chat_created
     ON messages (chat_id, created_at)`,
+
+  // --- Phase 1: bot-scoped schema ------------------------------------------
+  //
+  // Every table above keys memory on chat_id, which is one memory per chat.
+  // The product is one memory per BOT, so the key here is (chat_id, bot_id).
+  // Two product requirements fall out of that key rather than out of a
+  // filtering convention someone has to remember:
+  //
+  //   - a bot carries what it learned in one group into the next (req 9),
+  //     because bot_owner_memory is keyed on bot_id alone;
+  //   - two owners' bots never mix (req 10), because bot_id -> owner_user_id
+  //     is a foreign key, not a column that callers must filter by.
+  //
+  // Purely additive: no existing table or row is touched.
+  `CREATE TABLE IF NOT EXISTS bots (
+    bot_id BIGSERIAL PRIMARY KEY,
+    owner_user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    telegram_user_id BIGINT NOT NULL UNIQUE,
+    telegram_token TEXT,
+    display_name TEXT NOT NULL,
+    persona TEXT,
+    model_tier TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS bot_chats (
+    bot_id BIGINT NOT NULL REFERENCES bots(bot_id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    enabled BOOLEAN DEFAULT TRUE,
+    relay_position INT NOT NULL DEFAULT 0,
+    is_primary BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (bot_id, chat_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS bot_messages (
+    id BIGSERIAL PRIMARY KEY,
+    bot_id BIGINT NOT NULL REFERENCES bots(bot_id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL,
+    sender TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_bot_messages_bot_chat_created
+    ON bot_messages (bot_id, chat_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS bot_summaries (
+    bot_id BIGINT NOT NULL REFERENCES bots(bot_id) ON DELETE CASCADE,
+    chat_id BIGINT NOT NULL,
+    summary TEXT DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (bot_id, chat_id)
+  )`,
+  // Keyed on bot_id ALONE on purpose - see the note above. That is what makes
+  // cross-group memory reuse (req 9) a property of the schema.
+  `CREATE TABLE IF NOT EXISTS bot_owner_memory (
+    bot_id BIGINT PRIMARY KEY REFERENCES bots(bot_id) ON DELETE CASCADE,
+    summary TEXT DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`,
 ];
 
 // One statement per call. Supabase's pooler runs in transaction mode, which
@@ -247,4 +303,139 @@ export async function getChatTitle(chatId) {
 export async function closePool() {
   if (pool) await pool.end();
   pool = undefined;
+}
+
+// --- Phase 1: bot-scoped accessors -----------------------------------------
+//
+// The functions above are the single-bot path and stay untouched so the live
+// bot keeps working. These are the multi-bot path, keyed on (bot_id, chat_id).
+
+export async function createBot({
+  ownerUserId,
+  telegramUserId,
+  displayName,
+  telegramToken = null,
+  persona = null,
+  modelTier = null,
+}) {
+  const { rows } = await getPool().query(
+    `INSERT INTO bots
+       (owner_user_id, telegram_user_id, display_name, telegram_token, persona, model_tier)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
+    [ownerUserId, telegramUserId, displayName, telegramToken, persona, modelTier]
+  );
+  return rows[0];
+}
+
+export async function getBotByTelegramUserId(telegramUserId) {
+  const { rows } = await getPool().query(
+    `SELECT * FROM bots WHERE telegram_user_id = $1`,
+    [telegramUserId]
+  );
+  return rows[0] ?? null;
+}
+
+// Case-insensitive on the name, but scoped to the chat: two owners may both
+// have a bot called "Helper" in different groups, and each owner's own bot
+// must be the one that answers.
+export async function getBotByName(chatId, name) {
+  const { rows } = await getPool().query(
+    `SELECT b.*, bc.relay_position, bc.is_primary
+       FROM bots b
+       JOIN bot_chats bc ON bc.bot_id = b.bot_id
+      WHERE bc.chat_id = $1 AND lower(b.display_name) = lower($2)
+      LIMIT 1`,
+    [chatId, name ?? ""]
+  );
+  return rows[0] ?? null;
+}
+
+export async function linkBotToChat(botId, chatId, { relayPosition = 0, isPrimary = false } = {}) {
+  await getPool().query(
+    `INSERT INTO bot_chats (bot_id, chat_id, relay_position, is_primary)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (bot_id, chat_id)
+     DO UPDATE SET relay_position = EXCLUDED.relay_position,
+                   is_primary = EXCLUDED.is_primary`,
+    [botId, chatId, relayPosition, isPrimary]
+  );
+}
+
+export async function getBotsForChat(chatId) {
+  const { rows } = await getPool().query(
+    `SELECT b.*, bc.relay_position, bc.is_primary
+       FROM bots b
+       JOIN bot_chats bc ON bc.bot_id = b.bot_id
+      WHERE bc.chat_id = $1 AND bc.enabled = TRUE
+      ORDER BY bc.relay_position ASC, b.bot_id ASC`,
+    [chatId]
+  );
+  return rows;
+}
+
+export async function insertBotMessage(botId, chatId, sender, text) {
+  const safeSender = sender || "Unknown";
+  const safeText = text ?? "";
+  await getPool().query(
+    `INSERT INTO bot_messages (bot_id, chat_id, sender, text)
+     VALUES ($1, $2, $3, $4)`,
+    [botId, chatId, safeSender, safeText]
+  );
+}
+
+export async function getRecentBotMessages(botId, chatId, limit) {
+  const { rows } = await getPool().query(
+    `SELECT sender, text, created_at FROM bot_messages
+      WHERE bot_id = $1 AND chat_id = $2
+      ORDER BY created_at DESC, id DESC
+      LIMIT $3`,
+    [botId, chatId, limit]
+  );
+  return rows.reverse();
+}
+
+export async function getBotMessageCount(botId, chatId) {
+  const { rows } = await getPool().query(
+    `SELECT COUNT(*)::int AS count FROM bot_messages
+      WHERE bot_id = $1 AND chat_id = $2`,
+    [botId, chatId]
+  );
+  return rows[0].count;
+}
+
+export async function getBotSummary(botId, chatId) {
+  const { rows } = await getPool().query(
+    `SELECT summary FROM bot_summaries WHERE bot_id = $1 AND chat_id = $2`,
+    [botId, chatId]
+  );
+  return rows[0]?.summary ?? "";
+}
+
+export async function updateBotSummary(botId, chatId, summary) {
+  await getPool().query(
+    `INSERT INTO bot_summaries (bot_id, chat_id, summary, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (bot_id, chat_id)
+     DO UPDATE SET summary = EXCLUDED.summary, updated_at = now()`,
+    [botId, chatId, summary]
+  );
+}
+
+export async function getBotOwnerMemory(botId) {
+  const { rows } = await getPool().query(
+    `SELECT summary FROM bot_owner_memory WHERE bot_id = $1`,
+    [botId]
+  );
+  return rows[0]?.summary ?? "";
+}
+
+export async function updateBotOwnerMemory(botId, summary) {
+  await getPool().query(
+    `INSERT INTO bot_owner_memory (bot_id, summary, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (bot_id)
+     DO UPDATE SET summary = EXCLUDED.summary, updated_at = now()`,
+    [botId, summary]
+  );
 }

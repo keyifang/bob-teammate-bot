@@ -186,7 +186,8 @@ before(async () => {
 
   admin = new pg.Pool({ connectionString: TEST_DB });
   await admin.query(
-    "DROP TABLE IF EXISTS messages, chat_participants, chats, users CASCADE"
+    `DROP TABLE IF EXISTS bot_owner_memory, bot_summaries, bot_messages,
+     bot_chats, bots, messages, chat_participants, chats, users CASCADE`
   );
 
   const uiBase = `http://127.0.0.1:${stubPort}`;
