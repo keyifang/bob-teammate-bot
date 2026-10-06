@@ -34,7 +34,6 @@ import {
   getBotsForChat,
   insertBotMessage,
   getRecentBotMessages,
-  getBotMessageCount,
   getBotSummary,
   updateBotSummary,
   getBotOwnerMemory,
@@ -111,12 +110,10 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
 // not recognised, which degrades to the single-bot behaviour rather than
 // misrouting.
 let relayTelegramUserId = null;
-let relayDisplayName = BOB_NAME ?? "Bob";
 bot
   .getMe()
   .then((me) => {
     relayTelegramUserId = me?.id ?? null;
-    relayDisplayName = me?.first_name || relayDisplayName;
     // Logged because routing correctness depends on this having arrived; the
     // e2e harness waits for this line so its named-bot tests are not racing it.
     console.log(`relay identity: ${relayTelegramUserId}`);
