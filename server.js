@@ -38,6 +38,14 @@ import {
   updateBotSummary,
   getBotOwnerMemory,
   getSubscription,
+  claimUpdate,
+  pruneProcessedUpdates,
+  getUserModelConfig,
+  setUserModelConfig,
+  clearUserModelConfig,
+  getCreditBalance,
+  addCredits,
+  getCreditLedger,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
@@ -47,6 +55,32 @@ import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
 import { renderDocumentHtml, safeFileName } from "./document.js";
 import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
+import { getFormat, defaultFormat, fileNameFor } from "./export.js";
+import { renderPdfBuffer } from "./pdf.js";
+import {
+  parseCommand,
+  parseCallback,
+  buildProviderKeyboard,
+  buildModelKeyboard,
+  buildCreditKeyboard,
+  buildFormatKeyboard,
+  describeModelChoice,
+} from "./commands.js";
+import {
+  listProviders,
+  getProvider,
+  getModel,
+  validateKeyFormat,
+  resolveUserModel,
+} from "./providers.js";
+import {
+  CREDIT_PACKS,
+  creditsForPack,
+  hasBalance,
+  costOfCall,
+  formatUsd,
+  LOW_BALANCE_MICRO,
+} from "./credits.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -141,9 +175,22 @@ function log(chatId, message) {
 // Token usage is logged for every call so running cost is observable (FR-13).
 // Reasoning models bill reasoning tokens as completion tokens, so they are
 // broken out - otherwise a free model looks like it is spending money.
-function logUsage(chatId, label, data) {
+function logUsage(chatId, label, data, meter) {
   const usage = data?.usage;
   if (!usage) return;
+  // Accumulate the turn's real cost. The provider's own reported cost wins when
+  // present: it already accounts for cache discounts and routing, so
+  // recomputing from list prices would overcharge the user.
+  if (meter) {
+    const reported = typeof usage.cost === "number" ? usage.cost : undefined;
+    meter.micro += costOfCall({
+      promptTokens: usage.prompt_tokens,
+      completionTokens: usage.completion_tokens,
+      reportedCostUsd: reported,
+      promptPricePerToken: meter.promptPricePerToken,
+      completionPricePerToken: meter.completionPricePerToken,
+    });
+  }
   const reasoning = usage.completion_tokens_details?.reasoning_tokens;
   const cost = typeof usage.cost === "number" ? ` cost=$${usage.cost.toFixed(6)}` : "";
   log(
@@ -155,10 +202,10 @@ function logUsage(chatId, label, data) {
   );
 }
 
-function modelHeaders() {
+function modelHeaders(apiKey = MODEL_API_KEY) {
   const headers = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${MODEL_API_KEY}`,
+    Authorization: `Bearer ${apiKey}`,
   };
   // OpenRouter uses these to attribute traffic; they are harmless and
   // ignored by any other provider.
@@ -220,16 +267,21 @@ function overloadDelay(attempt) {
   return Math.floor(Math.random() * ceiling);
 }
 
-async function modelRequest(chatId, label, payload) {
+async function modelRequest(chatId, label, payload, route = {}, meter = null) {
   const startedAt = Date.now();
   let lastOverload = null;
+  // A user who supplied their own key hits their own endpoint; otherwise the
+  // deployment default. Resolved per call so a config change takes effect on
+  // the next message rather than at restart.
+  const apiUrl = route.apiUrl || MODEL_API_URL;
+  const apiKey = route.apiKey || MODEL_API_KEY;
 
   for (let attempt = 0; attempt < OVERLOAD_MAX_ATTEMPTS; attempt++) {
     let res;
     try {
-      res = await fetch(MODEL_API_URL, {
+      res = await fetch(apiUrl, {
         method: "POST",
-        headers: modelHeaders(),
+        headers: modelHeaders(apiKey),
         body: JSON.stringify(payload),
         // A free-tier model queues unpredictably and thinks at length, so the
         // wait is bounded generously rather than tightly. Aborting early means
@@ -284,7 +336,7 @@ async function modelRequest(chatId, label, payload) {
       throw new Error(`Model returned no choices: ${text.slice(0, 200)}`);
     }
 
-    logUsage(chatId, label, data);
+    logUsage(chatId, label, data, meter);
     const elapsed = Date.now() - startedAt;
     if (elapsed > SLOW_CALL_MS) {
       log(chatId, `${label} was slow: ${(elapsed / 1000).toFixed(1)}s`);
@@ -383,7 +435,7 @@ function contentOf(data, { requireSubstance = false } = {}) {
 
 // One retry for a degenerate reply. Kept separate from the tool loop so a
 // truncation mid-chain is retried with the same message history.
-async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0, model = MODEL_NAME) {
+async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0, model = MODEL_NAME, route = {}) {
   const data = await modelRequest(chatId, label, {
     model,
     messages: [
@@ -392,13 +444,13 @@ async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX
     ],
     temperature: 0.8,
     max_tokens: maxTokens,
-  });
+  }, route);
   try {
     return contentOf(data, { requireSubstance: true });
   } catch (err) {
     if (attempt >= 1) throw err;
     log(chatId, `${label} truncated, retrying once: ${err.message}`);
-    return callModel(chatId, systemPrompt, userPrompt, maxTokens, label, attempt + 1, model);
+    return callModel(chatId, systemPrompt, userPrompt, maxTokens, label, attempt + 1, model, route);
   }
 }
 
@@ -415,7 +467,7 @@ const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
 const HUMANIZE_MAX_CHARS = Number(process.env.HUMANIZE_MAX_CHARS ?? 400);
 const HUMANIZE_SKIP_UNDER = process.env.HUMANIZE_SKIP_UNDER ?? "true";
 
-async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS.free) {
+async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS.free, route = {}, meter = { micro: 0 }) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
@@ -434,7 +486,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
     tool_choice: "auto",
     temperature: 0.7,
     max_tokens: REPLY_MAX_TOKENS,
-  });
+  }, route, meter);
   let choice = data.choices[0];
   let hops = 0;
 
@@ -489,7 +541,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
       tool_choice: isFinalHop ? "none" : "auto",
       temperature: 0.7,
       max_tokens: REPLY_MAX_TOKENS,
-    });
+    }, route, meter);
     choice = data.choices[0];
     hops++;
   }
@@ -501,7 +553,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
 // that measured ~35s and ~1800 reasoning tokens to reword a single sentence -
 // often more than the reply itself. It is skipped for text that is already
 // short and conversational, which is the common case for a chat reply.
-async function humanize(chatId, text, model = MODEL_NAME) {
+async function humanize(chatId, text, model = MODEL_NAME, route = {}) {
   if (HUMANIZE !== "true") return text;
   // Skip the extra call for replies already short enough to be in the persona's
   // casual register. HUMANIZE_SKIP_UNDER is opt-out, so setting it to false
@@ -510,7 +562,7 @@ async function humanize(chatId, text, model = MODEL_NAME) {
     return text;
   }
   try {
-    return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer", 0, model);
+    return await callModel(chatId, HUMANIZER_SYSTEM_PROMPT, text, REPLY_MAX_TOKENS, "humanizer", 0, model, route);
   } catch (err) {
     console.error("Humanizer failed, using raw text:", err.message);
     return text;
@@ -557,16 +609,17 @@ async function typingDelay(chatId, replyLength) {
 
 // finalize, when given, is applied to the text about to be sent (used to
 // guarantee Bob's AI disclosure on the first message of a private chat).
-async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME, plan = PLANS.free) {
+async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME, plan = PLANS.free, route = {}) {
   await bot.sendChatAction(chatId, "typing");
   const typingPing = setInterval(
     () => bot.sendChatAction(chatId, "typing").catch(() => {}),
     4000
   );
 
+  const meter = { micro: 0 };
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan, route, meter);
   } catch (err) {
     console.error("Reply generation failed:", err.message);
     // An overloaded free provider is transient and expected on a busy tier;
@@ -578,32 +631,34 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
   }
 
   const finalText = finalize
-    ? finalize(await humanize(chatId, reply, model))
-    : await humanize(chatId, reply, model);
+    ? finalize(await humanize(chatId, reply, model, route))
+    : await humanize(chatId, reply, model, route);
   await sendFormatted(chatId, finalText);
 
   await insertMessage(chatId, senderId, BOB_NAME, finalText);
   if (tagUnsolicited) await setLastUnsolicitedReply(chatId);
+  await meterUsage(route, meter.micro);
 }
 
 // A named bot is a persona consulted server-side: it has its own memory
 // (bot_messages keyed by bot_id), its own model tier, and its own voice, but
 // only the relay posts to Telegram. Returns the text that was sent, or null if
 // nothing was.
-async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = true, plan = PLANS.free } = {}) {
+async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = true, plan = PLANS.free, route = {} } = {}) {
   const model = modelForBot(bot);
   const personaName = bot.display_name;
 
+  const meter = { micro: 0 };
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan);
+    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan, route, meter);
   } catch (err) {
     console.error(`Reply from ${personaName} failed:`, err.message);
     reply = err?.overloaded ? OVERLOADED_REPLY : FALLBACK_REPLY;
   }
 
   // Attributed so a multi-bot group can tell who said what.
-  const finalText = `*${personaName}:* ${await humanize(chatId, reply, model)}`;
+  const finalText = `*${personaName}:* ${await humanize(chatId, reply, model, route)}`;
   if (record) {
     await sendFormatted(chatId, finalText);
     // Recorded against THIS bot's memory, never the relay's, so a later message
@@ -611,6 +666,7 @@ async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = t
     // its own transcript reads as a conversation it took part in.
     await insertBotMessage(bot.bot_id, chatId, personaName, finalText);
   }
+  await meterUsage(route, meter.micro);
   return finalText;
 }
 
@@ -649,7 +705,7 @@ async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = ""
 // A relay turn: the addressed bots answer in sequence, each seeing what the
 // ones before said. Bounded by planRelay, and abandoned the moment a newer
 // message arrives, so a slow free model cannot block someone chiming in.
-async function runRelayTurn(chatId, senderId, senderName, text, personas, plan = PLANS.free) {
+async function runRelayTurn(chatId, senderId, senderName, text, personas, plan = PLANS.free, route = {}) {
   const ordered = planRelay(personas);
   const token = relayTurns.begin(chatId);
   const replies = [];
@@ -664,7 +720,7 @@ async function runRelayTurn(chatId, senderId, senderName, text, personas, plan =
 
     const discussion = buildDiscussionContext(replies);
     const prompt = await buildPersonaPrompt(persona, chatId, senderName, text, discussion);
-    const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt, { plan });
+    const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt, { plan, route });
     replies.push({ name: persona.display_name, text: spoken });
   }
 
@@ -749,6 +805,47 @@ async function planForOwner(ownerUserId) {
   }
 }
 
+// Which provider, model and key a given user's reply should use.
+//
+// A user's own config wins; anything incomplete falls back to the deployment
+// default rather than breaking the bot, so a revoked key degrades to the
+// default instead of failing every reply.
+async function routeForUser(userId) {
+  const deploymentDefault = {
+    provider: "openrouter",
+    model: MODEL_NAME,
+    apiKey: MODEL_API_KEY,
+    apiUrl: MODEL_API_URL,
+  };
+  if (userId == null) return { ...resolveUserModel(null, deploymentDefault), userId: null };
+
+  let stored = null;
+  try {
+    stored = await getUserModelConfig(userId);
+  } catch (err) {
+    console.error("Model config lookup failed, using the default:", err.message);
+  }
+  return { ...resolveUserModel(stored, deploymentDefault), userId };
+}
+
+// Deducts the real cost of a turn from the payer's balance.
+//
+// BYOK users pay their provider directly, so nothing is deducted - charging
+// them would bill twice for the same tokens. A metering failure must never fail
+// a reply that was already sent, so it is logged and swallowed.
+async function meterUsage(route, costMicro) {
+  if (!route?.userId || route.usingOwnKey) return;
+  if (!costMicro || costMicro <= 0) return;
+  try {
+    const balance = await addCredits(route.userId, -costMicro, "model usage");
+    if (balance < LOW_BALANCE_MICRO) {
+      log(route.userId, `credit low: ${formatUsd(balance)} remaining`);
+    }
+  } catch (err) {
+    console.error("Credit metering failed:", err.message);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Triggering
 // ---------------------------------------------------------------------------
@@ -775,9 +872,43 @@ function isAddressedToBob(msg, text) {
 
 // `/export [title]` renders the last answer as a document and sends it.
 // sendDocument accepts bytes, so no public host is required.
+// Renders one export format and sends it as a document. PDF shells out to
+// pdf_export.py (ReportLab is pure Python, so it works on Render and Vercel
+// where WeasyPrint's GTK chain does not); the rest render in-process.
+async function sendExportDocument(chatId, title, body, formatId) {
+  const format = getFormat(formatId) ?? getFormat(defaultFormat());
+  const source = await getChatTitle(chatId);
+
+  let bytes;
+  if (format.needsProcess) {
+    try {
+      bytes = await renderPdfBuffer({ title, body, source });
+    } catch (err) {
+      console.error(`PDF export failed: ${err.message}`);
+      await sendFormatted(chatId, "Couldn't build the PDF - try text or HTML?");
+      return;
+    }
+  } else {
+    bytes = Buffer.from(format.render({ title, body, source }), "utf8");
+  }
+
+  try {
+    await bot.sendDocument(
+      chatId,
+      bytes,
+      { caption: `Here's "${title}" as ${format.label}.` },
+      { filename: fileNameFor(format, title), contentType: format.mime }
+    );
+  } catch (err) {
+    console.error("Document send failed:", err.message);
+    await sendFormatted(chatId, "Couldn't send that document - try again?");
+  }
+}
+
+// `/export [format] [title]` - the format is optional and defaults to PDF.
 async function handleExport(msg, chatId, text, sender) {
-  const match = text.match(/^\/export(?:@\w+)?\s*(.*)$/i);
-  if (!match) return false;
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "export") return false;
 
   const recent = await getRecentMessages(chatId, 20);
   // The most recent thing Bob said is what a user means by "export this".
@@ -787,26 +918,249 @@ async function handleExport(msg, chatId, text, sender) {
     return true;
   }
 
-  const requestedTitle = match[1].trim();
+  const args = parsed.args.split(/\s+/).filter(Boolean);
+  let formatId = defaultFormat();
+  if (args.length && getFormat(args[0].toLowerCase())) {
+    formatId = args.shift().toLowerCase();
+  }
+  const requestedTitle = args.join(" ").trim();
   const title = requestedTitle || `Bob notes - ${(await getChatTitle(chatId)) || "chat"}`;
-  const html = renderDocumentHtml({
-    title,
-    body: lastBot.text,
-    source: await getChatTitle(chatId),
+
+  await sendExportDocument(chatId, title, lastBot.text, formatId);
+  return true;
+}
+
+// Shows the format picker, so a user does not have to know the ids.
+async function offerExportFormats(chatId) {
+  const recent = await getRecentMessages(chatId, 20);
+  const lastBot = [...recent].reverse().find((m) => m.sender === BOB_NAME);
+  if (!lastBot) {
+    await sendFormatted(chatId, "Nothing to export yet - ask me something first.");
+    return;
+  }
+  await bot.sendMessage(chatId, "Pick a format:", {
+    reply_markup: buildFormatKeyboard(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Commands: /bot_model, /credits, /help
+// ---------------------------------------------------------------------------
+
+// Which bot's config a command applies to. A DM has one obvious answer; in a
+// group the sender must name a bot they own, so one person cannot reconfigure
+// someone else's bot.
+async function resolveConfigTarget(chatId, userId, args) {
+  const bots = await getBotsForChat(chatId);
+  const mine = bots.filter((b) => Number(b.owner_user_id) === Number(userId));
+  const candidates = mine.length ? mine : bots;
+
+  if (!candidates.length) return { error: "No bots here yet. Add one first." };
+
+  const named = args.trim();
+  if (named) {
+    const found = candidates.find(
+      (b) => b.display_name.toLowerCase() === named.toLowerCase()
+    );
+    if (!found) return { error: `You don't have a bot called "${named}" here.` };
+    return { bot: found };
+  }
+  if (candidates.length === 1) return { bot: candidates[0] };
+  return {
+    error:
+      `Which bot? Say /bot_model <name>. Here: ${candidates
+        .map((b) => b.display_name)
+        .join(", ")}`,
+  };
+}
+
+async function handleBotModelCommand(msg, chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "bot_model") return false;
+
+  const { bot: target, error } = await resolveConfigTarget(chatId, sender.id, parsed.args);
+  if (error) {
+    await sendFormatted(chatId, error);
+    return true;
+  }
+
+  const current = await getUserModelConfig(sender.id);
+  const currentLine = current
+    ? `Currently: ${describeModelChoice(current.provider, current.model) ?? current.model}`
+    : "Currently using the default model.";
+
+  await bot.sendMessage(
+    chatId,
+    `${currentLine}\n\nPick a provider for ${target.display_name}:`,
+    { reply_markup: buildProviderKeyboard() }
+  );
+  return true;
+}
+
+async function handleCreditsCommand(chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "credits") return false;
+
+  const balance = await getCreditBalance(sender.id);
+  const cfg = await getUserModelConfig(sender.id);
+  const usingOwnKey = Boolean(cfg?.apiKey);
+  const lines = [`Balance: ${formatUsd(balance)}`];
+  if (usingOwnKey) {
+    lines.push("You're using your own API key, so nothing is deducted from your balance.");
+  } else if (balance <= 0) {
+    lines.push("Buy credit to keep going without interruption.");
+  } else if (balance < LOW_BALANCE_MICRO) {
+    lines.push("Running low - top up to avoid interruptions.");
+  }
+  await bot.sendMessage(chatId, lines.join("\n"), {
+    reply_markup: buildCreditKeyboard(),
+  });
+  return true;
+}
+
+async function handleHelpCommand(chatId, text) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "help") return false;
+  await sendFormatted(
+    chatId,
+    [
+      "Commands:",
+      "/bot_model [name] - choose the model this chat's bot uses",
+      "/credits - balance and top-up",
+      "/export [format] [title] - export the last answer (pdf, html, markdown, text, csv)",
+      "",
+      "In a group, name a bot to talk to it: @Alice, or \"Alice: ...\".",
+    ].join("\n")
+  );
+  return true;
+}
+
+// Handles a keyed-in API key. The key is stored, never logged, and the message
+// carrying it is deleted where Telegram allows it.
+async function handleKeySubmission(msg, chatId, text, sender) {
+  if (!pendingKeyPrompt.has(sender.id)) return false;
+  const pending = pendingKeyPrompt.get(sender.id);
+  // Expire the prompt so an unrelated later message is not swallowed.
+  if (Date.now() - pending.at > 5 * 60 * 1000) {
+    pendingKeyPrompt.delete(sender.id);
+    return false;
+  }
+  pendingKeyPrompt.delete(sender.id);
+
+  const provider = getProvider(pending.provider);
+  const model = getModel(pending.provider, pending.model);
+  if (!provider || !model) {
+    await sendFormatted(chatId, "That model is no longer available - start again with /bot_model.");
+    return true;
+  }
+
+  const check = validateKeyFormat(pending.provider, text.trim());
+  if (!check.ok) {
+    await sendFormatted(chatId, check.error);
+    return true;
+  }
+
+  await setUserModelConfig(sender.id, {
+    provider: pending.provider,
+    model: pending.model,
+    apiKey: check.key,
   });
 
-  try {
-    await bot.sendDocument(
-      chatId,
-      Buffer.from(html, "utf8"),
-      { caption: `Here's "${title}" as a document.` },
-      { filename: safeFileName(title), contentType: "text/html" }
-    );
-  } catch (err) {
-    console.error("Document send failed:", err.message);
-    await sendFormatted(chatId, "Couldn't send that document - try again?");
-  }
+  // Remove the message carrying the secret where the bot has rights to.
+  bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+
+  await sendFormatted(
+    chatId,
+    `Saved. ${describeModelChoice(pending.provider, pending.model)} You're using your own key now, so calls are billed to you directly.`
+  );
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Inline callbacks
+// ---------------------------------------------------------------------------
+
+// Key prompts are short-lived and per user. A Map is acceptable here because a
+// dropped prompt only means the user re-runs /bot_model - the config itself
+// lives in Postgres, so nothing is lost on serverless.
+const pendingKeyPrompt = new Map();
+
+async function handleCallbackQuery(query) {
+  const chatId = query?.message?.chat?.id;
+  const userId = query?.from?.id;
+  const data = query?.data;
+  if (!chatId || !userId) return;
+
+  const cb = parseCallback(data);
+  // Always answer, or the client shows a spinner until it times out.
+  const ack = (text) => bot.answerCallbackQuery(query.id, text ? { text } : {}).catch(() => {});
+
+  if (!cb.action) {
+    return ack("That button is no longer valid.");
+  }
+
+  if (cb.action === "provider") {
+    const provider = getProvider(cb.provider);
+    await ack(`Provider: ${provider.label}`);
+    await bot.sendMessage(chatId, `Pick a model from ${provider.label}:`, {
+      reply_markup: buildModelKeyboard(cb.provider),
+    });
+    return;
+  }
+
+  if (cb.action === "model") {
+    const model = getModel(cb.provider, cb.model);
+    await ack(model.label);
+
+    // A free model needs no key, so it can be applied immediately.
+    if (model.tier === "free") {
+      // The deployment key is used for free models, so clear any stored one.
+      await clearUserModelConfig(userId);
+      await sendFormatted(
+        chatId,
+        `Done - using ${describeModelChoice(cb.provider, cb.model)} No key needed.`
+      );
+      return;
+    }
+
+    pendingKeyPrompt.set(userId, {
+      provider: cb.provider,
+      model: cb.model,
+      at: Date.now(),
+    });
+    await sendFormatted(
+      chatId,
+      `Send me your ${getProvider(cb.provider).label} API key as your next message and I'll save it.\n\nI'll delete your message once it's saved. You can cancel with /bot_model.`
+    );
+    return;
+  }
+
+  if (cb.action === "buy") {
+    const pack = CREDIT_PACKS.find((p) => p.id === cb.pack);
+    await ack(`Selected ${pack.label}`);
+    // No payment provider is wired yet, and inventing a fake "paid" state would
+    // hand out credit nobody paid for. This states the real situation.
+    await sendFormatted(
+      chatId,
+      `You picked the ${pack.label} pack (${formatUsd(creditsForPack(pack))} of credit). Card payment isn't connected on this deployment yet - nothing has been charged.`
+    );
+    return;
+  }
+
+  if (cb.action === "export") {
+    await ack();
+    const recent = await getRecentMessages(chatId, 20);
+    const lastBot = [...recent].reverse().find((m) => m.sender === BOB_NAME);
+    if (!lastBot) {
+      await sendFormatted(chatId, "Nothing to export yet.");
+      return;
+    }
+    const title = `Bob notes - ${(await getChatTitle(chatId)) || "chat"}`;
+    await sendExportDocument(chatId, title, lastBot.text, cb.format);
+    return;
+  }
+
+  return ack();
 }
 
 // ---------------------------------------------------------------------------
@@ -907,9 +1261,22 @@ async function handleUpdate(update) {
   relayTurns.cancel(chatId);
 
   // A command is handled before routing, so "/export" is never mistaken for a
-  // message addressed to a bot.
+  // message addressed to a bot. A pending key prompt is checked first, because
+  // an API key is not a command and must not be treated as chat text.
+  if (await handleKeySubmission(msg, chatId, text, sender)) {
+    return;
+  }
   if (await handleExport(msg, chatId, text, sender)) {
     summarizeSafely(chatId);
+    return;
+  }
+  if (await handleBotModelCommand(msg, chatId, text, sender)) {
+    return;
+  }
+  if (await handleCreditsCommand(chatId, text, sender)) {
+    return;
+  }
+  if (await handleHelpCommand(chatId, text)) {
     return;
   }
 
@@ -938,7 +1305,10 @@ async function handleUpdate(update) {
     // unrelated replies.
     if (personas.length === 1) {
       const prompt = await buildPersonaPrompt(personas[0], chatId, senderName, cleaned, "");
-      await sendNamedBotReply(chatId, sender.id, personas[0], prompt, { plan: personaPlan });
+      await sendNamedBotReply(chatId, sender.id, personas[0], prompt, {
+        plan: personaPlan,
+        route: await routeForUser(personas[0].owner_user_id),
+      });
       summarizeSafely(chatId);
       return;
     }
@@ -947,7 +1317,7 @@ async function handleUpdate(update) {
     // awaiting the turn here would hold the queue for its whole duration - and
     // the human's interjection would sit behind it, unable to cancel anything.
     // Starting it detached is what makes chiming in work at all.
-    runRelayTurn(chatId, sender.id, senderName, cleaned, personas, personaPlan).catch((err) =>
+    runRelayTurn(chatId, sender.id, senderName, cleaned, personas, personaPlan, await routeForUser(personas[0].owner_user_id)).catch((err) =>
       console.error(`Relay turn failed for chat ${chatId}:`, err.message)
     );
     summarizeSafely(chatId);
@@ -988,6 +1358,7 @@ async function handleUpdate(update) {
       firstContact: claimed,
     });
 
+    const senderRoute = await routeForUser(sender.id);
     try {
       await sendBobReply(
         chatId,
@@ -995,8 +1366,9 @@ async function handleUpdate(update) {
         userPrompt,
         jumpingIn,
         claimed ? ensureAiDisclosure : undefined,
-        MODEL_NAME,
-        await planForOwner(owner?.user_id)
+        senderRoute.model,
+        await planForOwner(owner?.user_id),
+        senderRoute
       );
     } catch (err) {
       // A failed reply must still disclose, but must not burn the claim if the
@@ -1015,18 +1387,18 @@ async function handleUpdate(update) {
 
 // Telegram retries a webhook it could not deliver, so the same update_id can
 // arrive twice. Replying to it twice is a visible defect (TC-35).
-const seenUpdates = new Set();
-const seenUpdateOrder = [];
-
-function isDuplicateUpdate(updateId) {
+//
+// This lives in Postgres, not in a Set: on serverless an invocation shares no
+// memory with the last one, so an in-process Set would let a retry through on a
+// different instance. The table's PRIMARY KEY does the arbitration, so two
+// concurrent claims cannot both win.
+async function isDuplicateUpdate(updateId, chatId) {
   if (updateId === undefined || updateId === null) return false;
-  if (seenUpdates.has(updateId)) return true;
-  seenUpdates.add(updateId);
-  seenUpdateOrder.push(updateId);
-  while (seenUpdateOrder.length > SEEN_UPDATE_LIMIT) {
-    seenUpdates.delete(seenUpdateOrder.shift());
-  }
-  return false;
+  const claimed = await claimUpdate(updateId, chatId ?? 0);
+  // Keep the table bounded. Cheap enough to do on every update at this volume,
+  // and a failure here must not drop the message.
+  pruneProcessedUpdates(SEEN_UPDATE_LIMIT).catch(() => {});
+  return !claimed;
 }
 
 // One in-flight job per chat. Without this, two quick messages start two
@@ -1055,9 +1427,15 @@ app.post("/telegram-webhook", async (req, res) => {
   res.sendStatus(200);
 
   const update = req.body;
-  if (isDuplicateUpdate(update?.update_id)) return;
+  const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
+  if (await isDuplicateUpdate(update?.update_id, chatId)) return;
 
-  const chatId = update?.message?.chat?.id;
+  // A button press is its own update type and never carries a message.
+  if (update?.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
   if (chatId === undefined) {
     await enqueueForChat("global", () => handleUpdate(update));
     return;

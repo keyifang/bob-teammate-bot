@@ -26,16 +26,20 @@ const HOISTED = [
 ];
 
 function extract(source, name, extraConstants = []) {
-  const start = source.indexOf(`function ${name}(`);
+  // Normalise line endings first. The source is CRLF on a Windows checkout and
+  // LF elsewhere; searching for "\n}\n" against CRLF silently found nothing and
+  // reported the function as missing.
+  const src = source.replace(/\r\n/g, "\n");
+  const start = src.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`${name} not found in server.js`);
-  const end = source.indexOf("\n}\n", start);
+  const end = src.indexOf("\n}\n", start);
   if (end < 0) throw new Error(`end of ${name} not found`);
   const wanted = [...extraConstants, ...HOISTED];
   const preamble = wanted
-    .map((c) => source.match(new RegExp(`^const ${c} = .*$`, "m"))?.[0])
+    .map((c) => src.match(new RegExp(`^const ${c} = .*$`, "m"))?.[0])
     .filter(Boolean)
     .join("\n");
-  return new Function(`${preamble}\n${source.slice(start, end + 2)}; return ${name};`)();
+  return new Function(`${preamble}\n${src.slice(start, end + 2)}; return ${name};`)();
 }
 
 test("overload classification covers the observed failure and rejects real errors", async () => {

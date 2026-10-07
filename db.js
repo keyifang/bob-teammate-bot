@@ -620,7 +620,16 @@ export async function getUserModelConfig(userId) {
     `SELECT provider, model, api_key FROM user_model_config WHERE user_id = $1`,
     [userId]
   );
-  return rows[0] ?? null;
+  if (!rows[0]) return null;
+  // Returned in the camelCase shape every caller uses. Returning the raw row
+  // meant `apiKey` was undefined, so resolveUserModel saw a missing key and
+  // silently fell back to the deployment default - the user's saved model
+  // never took effect.
+  return {
+    provider: rows[0].provider,
+    model: rows[0].model,
+    apiKey: rows[0].api_key,
+  };
 }
 
 export async function setUserModelConfig(userId, { provider, model, apiKey }) {

@@ -21,9 +21,10 @@ before(async () => {
   if (!TEST_DB) return;
   admin = new pg.Pool({ connectionString: TEST_DB });
   await admin.query(
-    `DROP TABLE IF EXISTS subscriptions, bot_owner_memory, bot_summaries,
-     bot_messages, bot_chats, bots, messages, chat_participants, chats,
-     users CASCADE`
+    `DROP TABLE IF EXISTS processed_updates, chat_locks, credit_ledger,
+     user_model_config, user_credits, subscriptions, bot_owner_memory,
+     bot_summaries, bot_messages, bot_chats, bots, messages,
+     chat_participants, chats, users CASCADE`
   );
   // db.js reads DATABASE_URL at import time, so set it before importing.
   process.env.DATABASE_URL = TEST_DB;

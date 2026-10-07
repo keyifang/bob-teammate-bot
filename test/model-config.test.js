@@ -61,23 +61,33 @@ test("with no fallback the deployment default is used, and it is read lazily", (
 // The seam only earns its keep if the reply path actually routes through it.
 // Without this, resolveModel could be perfect and unused.
 test("the reply path takes a model rather than hardcoding the global", async () => {
-  const src = await readFile(path.join(ROOT, "server.js"), "utf8");
+  // Normalise line endings: the source is CRLF on a Windows checkout and LF
+  // elsewhere, and a "\n}\n" search against CRLF finds nothing.
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(/\r\n/g, "\n");
 
-  assert.match(
-    src,
-    /async function callModelWithTools\(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS\.free\)/,
-    "callModelWithTools must accept the model to use, and the plan that bounds it"
-  );
-  assert.match(
-    src,
-    /async function humanize\(chatId, text, model = MODEL_NAME\)/,
-    "the humanizer must be able to use the same model as the reply"
-  );
-  assert.match(
-    src,
-    /async function sendBobReply\(chatId, senderId, userPrompt, tagUnsolicited, finalize, model = MODEL_NAME, plan = PLANS\.free\)/,
-    "sendBobReply must thread a model and a plan through"
-  );
+  // Assert the ESSENTIAL parameters rather than the whole signature, so adding
+  // a parameter (route, meter) does not break the test - while still failing if
+  // the model/plan threading is removed.
+  const sig = (name) => {
+    const i = src.indexOf(`async function ${name}(`);
+    return i < 0 ? "" : src.slice(i, src.indexOf(") {", i) + 1);
+  };
+
+  for (const [name, required] of [
+    ["callModelWithTools", ["model = MODEL_NAME", "plan = PLANS.free"]],
+    ["humanize", ["model = MODEL_NAME"]],
+    ["sendBobReply", ["model = MODEL_NAME", "plan = PLANS.free"]],
+    ["sendNamedBotReply", ["plan = PLANS.free"]],
+  ]) {
+    const s = sig(name);
+    assert.ok(s, `${name} must exist`);
+    for (const part of required) {
+      assert.ok(
+        s.includes(part),
+        `${name} must take ${part}, signature was: ${s}`
+      );
+    }
+  }
 
   // callModelWithTools must use the passed model, not the constant. Asserting
   // "no MODEL_NAME inside the body" is stronger than checking for the shape of
