@@ -97,6 +97,7 @@ import {
 import { renderPdfBuffer } from "./pdf.js";
 import {
   paymentsConfigured,
+  purchasesEnabled,
   verifyStripeSignature,
   parseStripeEvent,
   creditForCheckout,
@@ -1611,6 +1612,17 @@ async function handleCallbackQuery(query) {
     const pack = CREDIT_PACKS.find((p) => p.id === cb.pack);
     await ack(`Selected ${pack.label}`);
 
+    // Free-testing switch. Refused LOUDLY rather than silently ignored: a
+    // button that looks live and charges nobody is worse than one that says so.
+    if (!purchasesEnabled()) {
+      await sendFormatted(
+        chatId,
+        `Purchases are turned off on this deployment right now, so nothing has been ` +
+          `charged and the ${pack.label} pack wasn't started.`
+      );
+      return;
+    }
+
     if (!paymentsConfigured()) {
       // Saying so is the honest answer; the alternative is a button that
       // appears to work and grants credit nobody paid for.
@@ -2021,6 +2033,13 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
     // Configured off is not an error the caller can fix; say so plainly rather
     // than accepting an event we cannot verify.
     return res.status(503).send("payments are not configured");
+  }
+
+  // The switch covers the WEBHOOK, not just the button. Otherwise a checkout
+  // started before the switch was flipped would still deliver credit after it,
+  // which is exactly what "off" has to mean.
+  if (!purchasesEnabled()) {
+    return res.status(503).send("purchases are disabled");
   }
 
   const body = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";

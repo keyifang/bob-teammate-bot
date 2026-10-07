@@ -21,6 +21,22 @@ export function paymentsConfigured(env = process.env) {
   return Boolean(env.STRIPE_SECRET_KEY && env.STRIPE_WEBHOOK_SECRET);
 }
 
+// Kill-switch for free testing, without removing the integration.
+//
+// Defaults to ON: an unset variable must leave the real behaviour alone, because
+// guessing wrong here silently stops paying customers. Only an explicit false
+// value disables, so a typo cannot disable purchasing by accident.
+//
+// Set CREDIT_PURCHASES_ENABLED=false to test the AI freely; unset it to sell.
+const DISABLED_VALUES = new Set(["false", "0", "no", "off"]);
+
+export function purchasesEnabled(env = process.env) {
+  if (!env) return true;
+  const raw = String(env.CREDIT_PURCHASES_ENABLED ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return !DISABLED_VALUES.has(raw);
+}
+
 /**
  * Verifies a Stripe webhook signature.
  *
