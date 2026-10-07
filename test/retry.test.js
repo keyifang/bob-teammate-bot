@@ -155,3 +155,63 @@ test("the retry loop checks for overload in a 200 body, not only a bad status", 
   );
   assert.match(source, /returned no choices/, "and must be retried as one");
 });
+
+// A failed tool must not become a refusal.
+//
+// OBSERVED live (2026-10-08): asked for Singapore's PSI, web_search failed, and
+// Bob replied "can't look it up right now - search is hitting a limit". The user
+// pushed back with "you can actually do webfetch", and Bob then emitted raw
+// tool-call markup into the chat instead of fetching the page it had just been
+// told about.
+//
+// The general rule: a failure in one tool is a reason to try ANOTHER tool, and
+// only a reason to say "I can't" once every relevant tool has failed.
+test("a tool failure instructs the model to try another tool, not to refuse", async () => {
+  const source = await src();
+  const i = source.indexOf("Tool failed:");
+  assert.ok(i > 0, "a failed tool must report something to the model");
+  const window = source.slice(i, i + 700);
+
+  // The model is told what to do NEXT. Without this it treats one failure as
+  // "no information available" and tells the user it cannot look anything up.
+  assert.match(
+    window,
+    /another tool|try it now|every relevant tool/i,
+    "a failed tool must prompt a fallback attempt"
+  );
+  assert.match(
+    window,
+    /rate limited|unavailable/,
+    "the fallback instruction must explicitly contradict the excuse the model invented"
+  );
+});
+
+test("the persona forbids treating one failed tool as a general refusal", async () => {
+  const { PERSONA_SYSTEM_PROMPT } = await import("../config.js");
+  assert.match(
+    PERSONA_SYSTEM_PROMPT,
+    /when one tool fails/i,
+    "the general rule must be in the persona, not only in the tool error text"
+  );
+  assert.match(
+    PERSONA_SYSTEM_PROMPT,
+    /never as an excuse not to try/i,
+    "and it must forbid using a limitation as a reason not to try"
+  );
+  assert.ok(
+    !/say plainly that you cannot look it up/.test(PERSONA_SYSTEM_PROMPT),
+    "the old wording taught the model to refuse whenever a tool was unavailable"
+  );
+});
+
+test("protocol markup is rejected in content, so a broken tool call never posts", async () => {
+  // The second half of the same incident: after being pushed back, the model
+  // emitted <tool_call> markup as text. That reached the chat verbatim.
+  const source = await src();
+  assert.match(source, /TOOL_CALL_MARKUP_RE/, "protocol markup must be detected");
+  assert.match(
+    source,
+    /visibleOnly/,
+    "and invisible characters must be stripped first, or a zero-width space slips past"
+  );
+});

@@ -456,10 +456,131 @@ const MIN_PLAUSIBLE_REPLY_CHARS = Number(process.env.MIN_PLAUSIBLE_REPLY_CHARS ?
 // straight into a group chat, along with the system prompt and a message it was
 // asked to rewrite. That is a privacy leak and a display defect, so a reply
 // that looks like scratchpad is rejected and retried rather than sent.
+// Tool-call markup rendered as TEXT, rather than as a real tool call.
+//
+// OBSERVED live (2026-10-08): the model answered "search is hitting a limit",
+// the user pushed back, and the reply posted this verbatim into a group chat:
+//
+//     <tool_call>
+//     <function=web_fetch>
+//     <parameter=url>
+//     https://www.checkpointsg.com/haze
+//     </parameter>
+//     </function>
+//     </tool_call>
+//
+// The tags carry a ZERO-WIDTH SPACE (U+200B) so they do not render as markup in
+// a chat client - which is exactly why they were missed: the text looks
+// plausible, and the previous detector only knew prose-reasoning and
+// bulleted-self-audit shapes.
+//
+// Built from codepoints, never typed literally: an invisible character in this
+// source is impossible to review and impossible to reproduce.
+const ZWSP = String.fromCharCode(0x200b);
+const ZWNJ = String.fromCharCode(0x200c);
+
+// Every dialect a model may use when it emits a call as prose. The closing tags
+// are optional because a truncated generation loses them.
+const TOOL_CALL_MARKUP_RE = new RegExp(
+  [
+    // <tool_call> ... </tool_call>, with or without the zero-width space,
+    // or the underscore-free spelling some providers normalise to.
+    "<\s*[/\\]?\s*to_?o_?l_?c_?a_?l_?l_?\s*>",
+    "<\s*[/\\]?\s*fun_?c_?t_?i_?o_?n_?\s*>",
+    "<\s*[/\\]?\s*parameter[a-z_]*\s*>",
+    "<\s*[/\\]?\s*argument[a-z_]*\s*>",
+  ].join("|"),
+  "i"
+);
+
+// A fence or brace wrapper around the same idea, for providers that render a
+// call as JSON or a code block rather than XML.
+const TOOL_CALL_STRUCTURE_RE =
+  /(?:\{\s*"?(?:tool_call|function_call|tool_use)"?\s*:)|(?:```\s*(?:tool_call|function_call|tool_use)\b)|(?:\btool_call\s*\(\s*\{)/i;
+
 const REASONING_LEAK_RE =
   /^\s*(?:okay|ok|alright|hmm|so|let me|i need to|i'll|i will|first,?|thinking process|here'?s? (?:a )?thinking)\b[\s\S]{0,4000}?\n\s*(?:1\.|2\.|3\.|step 1|-\s)/i;
 
+// Strips invisible characters, so a zero-width space cannot be used to slip a
+// tag past the patterns above.
+function visibleOnly(text) {
+  return String(text ?? "")
+    .replace(new RegExp(ZWSP, "g"), "")
+    .replace(new RegExp(ZWNJ, "g"), "")
+    .replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, "");
+}
+
+// A tool call the model wrote as TEXT instead of emitting it structurally.
+//
+// OBSERVED live (2026-10-08): web_search failed, the model fell back to
+// web_fetch and got real data, then emitted this as its final content:
+//
+//     <tool_call>
+//     <function=web_search>
+//     <parameter=max_results>5</parameter>
+//     <parameter=query>NEA Singapore PSI current 2025</parameter>
+//     </function>
+//     </tool_call>
+//
+// Rejecting it (which the leak detector correctly does) leaves the user with
+// nothing - the fallback data was already in hand and thrown away. So the
+// markup is PARSED and executed as the call the model meant. A model that
+// knows what it wants should get it, rather than being scolded for spelling it
+// wrong.
+//
+// Returns null when the text is not a tool call, so the caller falls through to
+// the normal reply path.
+function parseTextToolCall(text) {
+  if (typeof text !== "string") return null;
+  const visible = visibleOnly(text);
+
+  // JSON form, checked FIRST because it needs no tags at all. A model may emit
+  // {"name":"web_fetch","arguments":{...}} with no wrapper, and treating that as
+  // prose throws away a perfectly clear call.
+  const jsonMatch = visible.match(
+    /\{\s*"?name"?\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"?arguments"?\s*:\s*(\{[\s\S]*?\})\s*\}/
+  );
+  if (jsonMatch) {
+    try {
+      return { name: jsonMatch[1], args: JSON.parse(jsonMatch[2]) ?? {} };
+    } catch {
+      return null;
+    }
+  }
+
+  if (!TOOL_CALL_MARKUP_RE.test(visible)) return null;
+
+  // <function=name> ... <parameter=key>value</parameter> ...
+  const nameMatch = visible.match(/<\s*function\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/i);
+  const name = nameMatch?.[1];
+  if (!name) return null;
+
+  const args = {};
+  const paramRe = /<\s*parameter\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/gi;
+  let m;
+  while ((m = paramRe.exec(visible)) !== null) {
+    args[m[1]] = m[2].trim();
+  }
+
+  // Coerce the obvious types: a model writing <parameter=max_results>5</parameter>
+  // means the number 5, not the string "5".
+  for (const [k, v] of Object.entries(args)) {
+    if (v === "true") args[k] = true;
+    else if (v === "false") args[k] = false;
+    else if (v !== "" && !Number.isNaN(Number(v))) args[k] = Number(v);
+  }
+  return { name, args };
+}
+
 function looksLikeReasoningLeak(text) {
+  if (typeof text !== "string" || !text.trim()) return false;
+
+  // Protocol markup is checked FIRST and on its own: it is unambiguous, and it
+  // is the one shape that reaches a user as visibly broken output.
+  const visible = visibleOnly(text);
+  if (TOOL_CALL_MARKUP_RE.test(visible)) return true;
+  if (TOOL_CALL_STRUCTURE_RE.test(visible)) return true;
+
   if (REASONING_LEAK_RE.test(text)) return true;
   // The scratchpad is a bulleted audit of the instructions, not prose. The
   // observed leak was four such lines, so the floor is three - a genuine
@@ -634,7 +755,20 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
         try {
           result = await executeTool(call.function.name, args);
         } catch (err) {
-          result = `Tool failed: ${err.message}`;
+          // The message is an INSTRUCTION, not just a diagnostic. Observed live:
+          // web_search failed, the model read the failure as "search is
+          // unavailable", told the user it could not look anything up, and never
+          // tried web_fetch - which would have answered. It has to be told that
+          // a failure in one tool is not a reason to refuse the question.
+          result = [
+            `Tool failed: ${err.message}`,
+            "This tool did not work, but another one may. If you have another tool that " +
+              "could answer (for example fetching a specific URL when searching failed), " +
+              "try it now. Only tell the user you cannot find something after every " +
+              "relevant tool has been tried. Do not describe this failure as being " +
+              "'rate limited', 'unavailable', or a general lack of access unless that " +
+              "is literally what went wrong - that reads as an excuse not to try.",
+          ].join(" ");
           log(chatId, `tool ${call.function.name} failed: ${err.message}`);
         }
       }
@@ -659,6 +793,40 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
     }, route, meter);
     choice = data.choices[0];
     hops++;
+  }
+
+  // The model may write its tool call as TEXT instead of emitting it
+  // structurally - observed live, where it discarded fallback results it
+  // already had and emitted <tool_call> markup as the reply. Executing it is
+  // what the model meant, and it beats telling a user with the data in hand
+  // that it could not find it.
+  if (typeof choice?.message?.content === "string") {
+    const asCall = parseTextToolCall(choice.message.content);
+    if (asCall) {
+      log(chatId, `executing a tool call the model wrote as text: ${asCall.name}`);
+      messages.push({ role: "user", content: choice.message.content });
+      let result;
+      const isSearch = asCall.name === "web_search" || asCall.name === "owl_research";
+      if (isSearch && !withinSearchBudget(plan, searchesUsed)) {
+        result = quotaMessage("research", plan);
+      } else {
+        if (isSearch) searchesUsed++;
+        try {
+          result = await executeTool(asCall.name, asCall.args);
+        } catch (err) {
+          result = `Tool failed: ${err.message}`;
+        }
+      }
+      messages.push({ role: "user", content: `Tool ${asCall.name} returned:
+${String(result).slice(0, 6000)}` });
+      // One more call to turn the result into an actual answer.
+      data = await modelRequest(chatId, "reply after text tool call", {
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: REPLY_MAX_TOKENS,
+      }, route, meter);
+    }
   }
 
   return contentOf(data, { requireSubstance: true });
@@ -736,7 +904,14 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
   try {
     reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan, route, meter);
   } catch (err) {
-    console.error("Reply generation failed:", err.message);
+    // The reason is logged AND carried into the log line the operator reads.
+    // A bare "hit an error" to the user with no record of why is the failure
+    // mode that cost the most time to diagnose here.
+    console.error(
+      "Reply generation failed:",
+      err?.message,
+      err?.stack ? String.fromCharCode(10) + err.stack.split(String.fromCharCode(10)).slice(1, 4).join(" | ") : ""
+    );
     // An overloaded free provider is transient and expected on a busy tier;
     // saying so is more useful than a generic "try asking again", because the
     // user knows the question was fine and should simply retry.

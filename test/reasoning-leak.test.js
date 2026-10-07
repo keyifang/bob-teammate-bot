@@ -17,7 +17,9 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 // so the test cannot pass while the shipped logic is broken.
 async function loadDetector() {
   const src = await readFile(path.join(ROOT, "server.js"), "utf8");
-  const start = src.indexOf("const REASONING_LEAK_RE");
+  // Start above ZWSP/ZWNJ and the markup regexes, which the detector
+  // closes over - slicing from REASONING_LEAK_RE gives a ReferenceError.
+  const start = src.indexOf("const ZWSP =");
   const end = src.indexOf("function contentOf");
   assert.ok(start > 0 && end > start, "detector not found in server.js");
   return new Function(`${src.slice(start, end)}; return looksLikeReasoningLeak;`)();
