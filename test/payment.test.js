@@ -116,3 +116,27 @@ test("every pack is purchasable, so no button leads to a dead checkout", () => {
     assert.ok(creditForCheckout(pack.id) > 0, `pack ${pack.id} grants nothing`);
   }
 });
+
+test("checkout includes a product tax code, which Stripe requires", async () => {
+  // Verified live: without it Stripe answers 400 "the product tax code is
+  // missing" and NO session is created, so /credits would silently fail.
+  const src = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../payment.js", import.meta.url), "utf8")
+  );
+  assert.match(
+    src,
+    /tax_code/,
+    "inline price_data requires a tax code or Stripe refuses the session"
+  );
+  assert.match(src, /txcd_\d+/, "and it must be a real tax code, not a placeholder");
+});
+
+test("the checkout carries the user id and pack, so the webhook knows whose balance to credit", async () => {
+  const src = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../payment.js", import.meta.url), "utf8")
+  );
+  // Without client_reference_id the webhook cannot tell whose balance to move,
+  // and without the pack it cannot tell how much.
+  assert.match(src, /client_reference_id/, "the webhook needs the user id");
+  assert.match(src, /metadata\[pack\]/, "and the pack");
+});

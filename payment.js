@@ -139,6 +139,10 @@ export async function createCheckoutSession({ packId, userId, successUrl, cancel
     "line_items[0][price_data][currency]": "usd",
     "line_items[0][price_data][unit_amount]": String(Math.round(pack.priceUsd * 100)),
     "line_items[0][price_data][product_data][name]": `Bob credit ${pack.label}`,
+    // Verified live: Stripe rejects inline price_data without a tax code
+    // ("the product tax code is missing"). Digital credit is not a physical
+    // good, so it takes the generic SaaS code.
+    "line_items[0][price_data][product_data][tax_code]": "txcd_10000000",
     client_reference_id: String(userId),
     "metadata[pack]": pack.id,
     "metadata[user_id]": String(userId),
