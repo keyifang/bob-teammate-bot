@@ -134,6 +134,61 @@ const SCHEMA_STATEMENTS = [
     stripe_customer_id TEXT,
     updated_at TIMESTAMPTZ DEFAULT now()
   )`,
+
+  // --- Phase B: shared state, so serverless works ---------------------------
+  //
+  // The in-process Maps (seenUpdates, chatQueues, relayTurns) hold on one
+  // long-lived server and fail on serverless, where invocations share no
+  // memory. These two tables restore the same guarantees via Postgres, so there
+  // is one code path for both Render and Vercel.
+  //
+  // Atomicity comes from the PRIMARY KEY / UNIQUE constraint, not from
+  // application logic: two concurrent inserts cannot both win.
+  `CREATE TABLE IF NOT EXISTS processed_updates (
+    update_id BIGINT NOT NULL,
+    chat_id BIGINT NOT NULL,
+    processed_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (update_id, chat_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_processed_updates_at
+    ON processed_updates (processed_at)`,
+  // A lease, not a mutex: expires_at means a crashed holder cannot wedge a chat
+  // forever. The holder is recorded so only the holder may release.
+  `CREATE TABLE IF NOT EXISTS chat_locks (
+    chat_id BIGINT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at TIMESTAMPTZ DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+  )`,
+
+  // --- Phase A/C: per-user model config and credit --------------------------
+  //
+  // The API key is stored because a BYOK request must send it. It is never
+  // logged and never returned to a chat.
+  `CREATE TABLE IF NOT EXISTS user_model_config (
+    user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`,
+  // Balance is an integer count of micro-dollars. Floats drift under repeated
+  // subtraction, and a ledger that drifts is a refund argument.
+  `CREATE TABLE IF NOT EXISTS user_credits (
+    user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    balance_micro BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`,
+  // Append-only, so a disputed balance can be reconstructed rather than argued.
+  `CREATE TABLE IF NOT EXISTS credit_ledger (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    delta_micro BIGINT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_credit_ledger_user
+    ON credit_ledger (user_id, created_at)`,
 ];
 
 // One statement per call. Supabase's pooler runs in transaction mode, which
@@ -488,4 +543,154 @@ export async function countBotsForOwner(ownerUserId) {
     [ownerUserId]
   );
   return rows[0].count;
+}
+
+// --- Phase B: shared state --------------------------------------------------
+
+/**
+ * Claims an update id for processing. Returns true for exactly one caller, even
+ * when several run concurrently - the PRIMARY KEY does the arbitration, not
+ * application logic, so it holds across serverless invocations that share no
+ * memory. A missing id is allowed through: discarding a real message as a
+ * duplicate is worse than processing it twice.
+ */
+export async function claimUpdate(updateId, chatId) {
+  if (updateId === undefined || updateId === null) return true;
+  const { rows } = await getPool().query(
+    `INSERT INTO processed_updates (update_id, chat_id)
+     VALUES ($1, $2)
+     ON CONFLICT (update_id, chat_id) DO NOTHING
+     RETURNING update_id`,
+    [updateId, chatId]
+  );
+  return rows.length > 0;
+}
+
+export async function pruneProcessedUpdates(keepPerChat = 500) {
+  const keep = Number(keepPerChat) || 500;
+  await getPool().query(
+    `DELETE FROM processed_updates p
+      WHERE p.processed_at < (
+        SELECT min(processed_at) FROM (
+          SELECT processed_at FROM processed_updates
+           WHERE chat_id = p.chat_id
+           ORDER BY processed_at DESC
+           LIMIT $1
+        ) recent
+      )`,
+    [keep]
+  );
+}
+
+/**
+ * Takes a per-chat lease. True means this holder may proceed.
+ *
+ * A lease rather than a mutex: `expires_at` lets a crashed holder be taken over
+ * instead of wedging the chat forever. The same holder may re-acquire its own
+ * lease, so a retry inside one logical job does not deadlock against itself.
+ */
+export async function acquireChatLock(chatId, holder, ttlSeconds = 60) {
+  const ttl = Math.max(1, Number(ttlSeconds) || 60);
+  const { rows } = await getPool().query(
+    `INSERT INTO chat_locks (chat_id, holder, acquired_at, expires_at)
+     VALUES ($1, $2, now(), now() + ($3 || ' seconds')::interval)
+     ON CONFLICT (chat_id) DO UPDATE
+       SET holder = EXCLUDED.holder,
+           acquired_at = now(),
+           expires_at = EXCLUDED.expires_at
+       WHERE chat_locks.expires_at < now()
+          OR chat_locks.holder = EXCLUDED.holder
+     RETURNING holder`,
+    [chatId, holder, String(ttl)]
+  );
+  return rows.length > 0;
+}
+
+export async function releaseChatLock(chatId, holder) {
+  await getPool().query(`DELETE FROM chat_locks WHERE chat_id = $1 AND holder = $2`, [
+    chatId,
+    holder,
+  ]);
+}
+
+// --- Phase A/C: per-user config and credit ----------------------------------
+
+export async function getUserModelConfig(userId) {
+  const { rows } = await getPool().query(
+    `SELECT provider, model, api_key FROM user_model_config WHERE user_id = $1`,
+    [userId]
+  );
+  return rows[0] ?? null;
+}
+
+export async function setUserModelConfig(userId, { provider, model, apiKey }) {
+  await getPool().query(
+    `INSERT INTO user_model_config (user_id, provider, model, api_key, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (user_id) DO UPDATE
+       SET provider = EXCLUDED.provider,
+           model = EXCLUDED.model,
+           api_key = EXCLUDED.api_key,
+           updated_at = now()`,
+    [userId, provider, model, apiKey]
+  );
+}
+
+export async function clearUserModelConfig(userId) {
+  await getPool().query(`DELETE FROM user_model_config WHERE user_id = $1`, [userId]);
+}
+
+export async function getCreditBalance(userId) {
+  const { rows } = await getPool().query(
+    `SELECT balance_micro FROM user_credits WHERE user_id = $1`,
+    [userId]
+  );
+  return rows[0] ? Number(rows[0].balance_micro) : 0;
+}
+
+/**
+ * Adds to a balance and records the movement, in one transaction.
+ *
+ * The ledger is append-only so a disputed balance can be reconstructed rather
+ * than argued about. A negative delta is clamped so a race between two calls
+ * cannot leave a negative balance, which would read as us owing the user.
+ */
+export async function addCredits(userId, deltaMicro, reason) {
+  const delta = Math.round(Number(deltaMicro) || 0);
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO user_credits (user_id, balance_micro, updated_at)
+       VALUES ($1, GREATEST($2, 0), now())
+       ON CONFLICT (user_id) DO UPDATE
+         SET balance_micro = GREATEST(user_credits.balance_micro + $2, 0),
+             updated_at = now()`,
+      [userId, delta]
+    );
+    await client.query(
+      `INSERT INTO credit_ledger (user_id, delta_micro, reason) VALUES ($1, $2, $3)`,
+      [userId, delta, String(reason ?? "adjustment")]
+    );
+    const { rows } = await client.query(
+      `SELECT balance_micro FROM user_credits WHERE user_id = $1`,
+      [userId]
+    );
+    await client.query("COMMIT");
+    return Number(rows[0].balance_micro);
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getCreditLedger(userId, limit = 20) {
+  const { rows } = await getPool().query(
+    `SELECT delta_micro, reason, created_at FROM credit_ledger
+      WHERE user_id = $1 ORDER BY id DESC LIMIT $2`,
+    [userId, Number(limit) || 20]
+  );
+  return rows;
 }

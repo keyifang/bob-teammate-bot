@@ -116,3 +116,69 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   stripe_customer_id TEXT,
   updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------------
+-- Shared state, so serverless works
+--
+-- The in-process Maps (seen updates, per-chat queues, relay turns) hold on one
+-- long-lived server and fail on serverless, where invocations share no memory.
+-- These tables restore the same guarantees via Postgres, so there is one code
+-- path for both Render and Vercel.
+--
+-- Atomicity comes from the PRIMARY KEY / UNIQUE constraint, not from
+-- application logic: two concurrent inserts cannot both win.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS processed_updates (
+  update_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  processed_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (update_id, chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_updates_at
+  ON processed_updates (processed_at);
+
+-- A lease, not a mutex: expires_at lets a crashed holder be taken over instead
+-- of wedging the chat forever. The holder is recorded so only it may release.
+CREATE TABLE IF NOT EXISTS chat_locks (
+  chat_id BIGINT PRIMARY KEY,
+  holder TEXT NOT NULL,
+  acquired_at TIMESTAMPTZ DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- Per-user model config and credit
+--
+-- The API key is stored because a BYOK request must send it. It is never
+-- logged and never returned to a chat.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS user_model_config (
+  user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Balance is an integer count of micro-dollars. Floats drift under repeated
+-- subtraction, and a ledger that drifts is a refund argument.
+CREATE TABLE IF NOT EXISTS user_credits (
+  user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+  balance_micro BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Append-only, so a disputed balance can be reconstructed rather than argued.
+CREATE TABLE IF NOT EXISTS credit_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  delta_micro BIGINT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user
+  ON credit_ledger (user_id, created_at);
