@@ -1330,7 +1330,7 @@ test("an obviously wrong key is refused and not stored", { skip }, async () => {
       chatType: "private",
       fromId: userId,
       fromName: "Human",
-      text: "8957151534:AAESjm5m1oam-qmIll7oxq1VHO7yZU_9bNg",
+      text: "9999999999:AAFAKEfakefakefakefakefakefakefakefakefake",
     }),
     { "X-Telegram-Bot-Api-Secret-Token": SECRET }
   );

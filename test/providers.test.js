@@ -99,7 +99,7 @@ test("validateKeyFormat accepts a plausible OpenRouter key and refuses an obviou
   assert.equal(validateKeyFormat("openrouter", "sk-or-v1-" + "a".repeat(40)).ok, true);
   // A Telegram bot token pasted by mistake must not be accepted silently.
   assert.equal(
-    validateKeyFormat("openrouter", "8957151534:AAESjm5m1oam-qmIll7oxq1VHO7yZU_9bNg").ok,
+    validateKeyFormat("openrouter", "9999999999:AAFAKEfakefakefakefakefakefakefakefakefake").ok,
     false
   );
 });
