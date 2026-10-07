@@ -61,7 +61,7 @@ test("render.yaml is valid JSON with a docker service and a health check", async
   assert.ok(svc, "render.yaml must declare a service");
   assert.equal(svc.runtime, "docker");
   assert.equal(svc.healthCheckPath, "/health", "a health check is what makes deploys detectable");
-  assert.equal(svc.dockerfilePath, "Dockerfile");
+  assert.equal(svc.dockerfilePath, "./Dockerfile");
 });
 
 test("render.yaml requires every secret rather than shipping a value", async () => {

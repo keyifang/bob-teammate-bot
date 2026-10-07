@@ -7,7 +7,8 @@
       "repo": "https://github.com/keyifang/bob-teammate-bot",
       "plan": "free",
       "branch": "main",
-      "dockerfilePath": "Dockerfile",
+      "dockerfilePath": "./Dockerfile",
+      "dockerContext": ".",
       "healthCheckPath": "/health",
       "envVars": [
         {
@@ -15,32 +16,12 @@
           "value": "production"
         },
         {
-          "key": "TELEGRAM_BOT_TOKEN",
-          "sync": false
-        },
-        {
-          "key": "MODEL_API_KEY",
-          "sync": false
-        },
-        {
           "key": "MODEL_API_URL",
           "value": "https://openrouter.ai/api/v1/chat/completions"
         },
         {
           "key": "MODEL_NAME",
-          "value": "nvidia/nemotron-3.5-lightning:free"
-        },
-        {
-          "key": "DATABASE_URL",
-          "sync": false
-        },
-        {
-          "key": "PGPOOL_MAX",
-          "value": "5"
-        },
-        {
-          "key": "WEBHOOK_SECRET",
-          "sync": false
+          "value": "nvidia/nemotron-3-ultra-550b-a55b:free"
         },
         {
           "key": "BOB_NAME",
@@ -55,32 +36,8 @@
           "value": "true"
         },
         {
-          "key": "UNSOLICITED_COOLDOWN_MS",
-          "value": "45000"
-        },
-        {
-          "key": "RECENT_MESSAGE_WINDOW",
-          "value": "20"
-        },
-        {
-          "key": "SUMMARY_TRIGGER_BUFFER",
-          "value": "20"
-        },
-        {
-          "key": "OWL_API_URL",
-          "sync": false
-        },
-        {
-          "key": "OWL_API_KEY",
-          "sync": false
-        },
-        {
-          "key": "REPLY_MAX_TOKENS",
-          "value": "2000"
-        },
-        {
-          "key": "SUMMARY_MAX_TOKENS",
-          "value": "4000"
+          "key": "PGPOOL_MAX",
+          "value": "5"
         },
         {
           "key": "RELAY_MAX_BOTS",
@@ -93,6 +50,42 @@
         {
           "key": "OVERLOAD_BASE_DELAY_MS",
           "value": "1500"
+        },
+        {
+          "key": "REPLY_MAX_TOKENS",
+          "value": "2000"
+        },
+        {
+          "key": "SUMMARY_MAX_TOKENS",
+          "value": "4000"
+        },
+        {
+          "key": "RECENT_MESSAGE_WINDOW",
+          "value": "10"
+        },
+        {
+          "key": "SUMMARY_TRIGGER_BUFFER",
+          "value": "30"
+        },
+        {
+          "key": "PYTHON_BIN",
+          "value": "python3"
+        },
+        {
+          "key": "TELEGRAM_BOT_TOKEN",
+          "sync": false
+        },
+        {
+          "key": "MODEL_API_KEY",
+          "sync": false
+        },
+        {
+          "key": "DATABASE_URL",
+          "sync": false
+        },
+        {
+          "key": "WEBHOOK_SECRET",
+          "sync": false
         }
       ]
     }
