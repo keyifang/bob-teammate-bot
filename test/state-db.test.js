@@ -161,3 +161,25 @@ test("locks in different chats are independent", { skip }, async () => {
   await db.releaseChatLock(9201, "x");
   await db.releaseChatLock(9202, "y");
 });
+
+test("claimPaymentEvent lets exactly one caller win, so a Stripe retry cannot double-credit", { skip }, async () => {
+  // Stripe retries a webhook it could not deliver, and a replayed
+  // checkout.session.completed must not grant the same credit twice - the same
+  // class of bug as a replayed Telegram update.
+  const results = await Promise.all(
+    Array.from({ length: 8 }, () => db.claimPaymentEvent("evt_same_id"))
+  );
+  assert.equal(results.filter(Boolean).length, 1, "more than one caller claimed the same event");
+});
+
+test("a different payment event still gets through", { skip }, async () => {
+  assert.equal(await db.claimPaymentEvent("evt_a"), true);
+  assert.equal(await db.claimPaymentEvent("evt_b"), true);
+  assert.equal(await db.claimPaymentEvent("evt_a"), false, "a repeat must be refused");
+});
+
+test("a payment event with no id is allowed through, not silently dropped", { skip }, async () => {
+  // Losing a real payment is worse than processing it twice.
+  assert.equal(await db.claimPaymentEvent(null), true);
+  assert.equal(await db.claimPaymentEvent(undefined), true);
+});

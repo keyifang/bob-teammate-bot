@@ -182,3 +182,10 @@ CREATE TABLE IF NOT EXISTS credit_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_user
   ON credit_ledger (user_id, created_at);
+
+-- Stripe retries a webhook it could not deliver. Without this, a replayed
+-- checkout.session.completed grants the same credit twice.
+CREATE TABLE IF NOT EXISTS processed_payments (
+  event_id TEXT PRIMARY KEY,
+  processed_at TIMESTAMPTZ DEFAULT now()
+);

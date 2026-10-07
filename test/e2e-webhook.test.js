@@ -11,6 +11,7 @@ import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
+import crypto from "node:crypto";
 import net from "node:net";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
@@ -25,6 +26,7 @@ const skip = TEST_DB
   : "set BOB_TEST_DATABASE_URL to a throwaway database to run";
 
 const SECRET = "test-secret-token-value";
+const STRIPE_WEBHOOK_SECRET = "whsec_e2e_test_secret";
 const BOT_USERNAME = "BobAssistantBot";
 const DB_NAME = "bobdb_test";
 
@@ -274,6 +276,11 @@ before(async () => {
       BOB_USERNAME: BOT_USERNAME,
       HUMANIZE: "true",
       WEBHOOK_SECRET: SECRET,
+      STRIPE_WEBHOOK_SECRET: STRIPE_WEBHOOK_SECRET,
+      // Both are needed for payments to be considered configured. A webhook
+      // secret alone must NOT be treated as ready, or the endpoint would
+      // accept events it cannot verify against the API.
+      STRIPE_SECRET_KEY: "sk_test_e2e",
       RECENT_MESSAGE_WINDOW: "20",
       SUMMARY_TRIGGER_BUFFER: "20",
       UNSOLICITED_COOLDOWN_MS: "45000",
@@ -1566,6 +1573,158 @@ test("the persona prompt actually receives the written summary", { skip }, async
     /SUMMARY_MARKER_the_budget_was_1200/,
     "the stored summary must reach the prompt"
   );
+});
+
+// --- Payments ---------------------------------------------------------------
+//
+// Credit is granted ONLY on a signature-verified webhook. The success redirect
+// is used to tell the user to come back, never to grant anything - trusting it
+// would let anyone mint credit by visiting a URL.
+
+test("a signature-verified checkout event credits the buyer's balance", { skip }, async () => {
+  const userId = 9101;
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Buyer')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [userId]
+  );
+  await admin.query("DELETE FROM user_credits WHERE user_id = $1", [userId]);
+
+  const event = JSON.stringify({
+    id: `evt_credit_${Date.now()}`,
+    type: "checkout.session.completed",
+    data: {
+      object: {
+        id: "cs_test_1",
+        client_reference_id: String(userId),
+        metadata: { pack: "starter", user_id: String(userId) },
+      },
+    },
+  });
+  const ts = Math.floor(Date.now() / 1000);
+  const v1 = crypto
+    .createHmac("sha256", STRIPE_WEBHOOK_SECRET)
+    .update(`${ts}.${event}`, "utf8")
+    .digest("hex");
+
+  const res = await fetch(`http://127.0.0.1:${serverPort}/stripe-webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Stripe-Signature": `t=${ts},v1=${v1}`,
+    },
+    body: event,
+  });
+  assert.equal(res.status, 200);
+
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+        [userId]
+      );
+      return rows.length === 1 && Number(rows[0].balance_micro) > 0;
+    },
+    { label: "credit granted" }
+  );
+
+  const { rows } = await admin.query(
+    "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+    [userId]
+  );
+  assert.ok(Number(rows[0].balance_micro) > 0, "the balance must be credited");
+});
+
+test("a replayed payment event does not double-credit", { skip }, async () => {
+  const userId = 9102;
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Buyer2')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [userId]
+  );
+
+  const eventId = `evt_replay_${Date.now()}`;
+  const event = JSON.stringify({
+    id: eventId,
+    type: "checkout.session.completed",
+    data: {
+      object: {
+        id: "cs_test_2",
+        client_reference_id: String(userId),
+        metadata: { pack: "starter", user_id: String(userId) },
+      },
+    },
+  });
+  const ts = Math.floor(Date.now() / 1000);
+  const v1 = crypto
+    .createHmac("sha256", STRIPE_WEBHOOK_SECRET)
+    .update(`${ts}.${event}`, "utf8")
+    .digest("hex");
+  const headers = {
+    "Content-Type": "application/json",
+    "Stripe-Signature": `t=${ts},v1=${v1}`,
+  };
+
+  await fetch(`http://127.0.0.1:${serverPort}/stripe-webhook`, { method: "POST", headers, body: event });
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+        [userId]
+      );
+      return rows.length === 1;
+    },
+    { label: "first credit" }
+  );
+  const first = await admin.query(
+    "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+    [userId]
+  );
+
+  // The retry, byte-identical.
+  await fetch(`http://127.0.0.1:${serverPort}/stripe-webhook`, { method: "POST", headers, body: event });
+  await pump();
+
+  const second = await admin.query(
+    "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+    [userId]
+  );
+  assert.equal(
+    Number(second.rows[0].balance_micro),
+    Number(first.rows[0].balance_micro),
+    "a replayed event must not grant credit twice"
+  );
+});
+
+test("an unsigned payment event grants nothing", { skip }, async () => {
+  const userId = 9103;
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Attacker')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [userId]
+  );
+  await admin.query("DELETE FROM user_credits WHERE user_id = $1", [userId]);
+
+  const event = JSON.stringify({
+    id: `evt_forged_${Date.now()}`,
+    type: "checkout.session.completed",
+    data: { object: { client_reference_id: String(userId), metadata: { pack: "bulk" } } },
+  });
+
+  // No signature at all.
+  const res = await fetch(`http://127.0.0.1:${serverPort}/stripe-webhook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: event,
+  });
+  assert.equal(res.status, 400, "an unsigned webhook must be refused");
+
+  await pump();
+  const { rows } = await admin.query(
+    "SELECT balance_micro FROM user_credits WHERE user_id = $1",
+    [userId]
+  );
+  assert.equal(rows.length, 0, "an unsigned event must not create credit");
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {

@@ -189,6 +189,12 @@ const SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_credit_ledger_user
     ON credit_ledger (user_id, created_at)`,
+  // Stripe retries a webhook it could not deliver. Without this, a replayed
+  // checkout.session.completed grants the same credit twice.
+  `CREATE TABLE IF NOT EXISTS processed_payments (
+    event_id TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ DEFAULT now()
+  )`,
 ];
 
 // One statement per call. Supabase's pooler runs in transaction mode, which
@@ -586,6 +592,23 @@ export async function claimUpdate(updateId, chatId) {
      ON CONFLICT (update_id, chat_id) DO NOTHING
      RETURNING update_id`,
     [updateId, chatId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Claims a Stripe event id. True for exactly one caller, so a retry cannot
+ * double-credit. A missing id is allowed through: losing a real payment is
+ * worse than processing it twice.
+ */
+export async function claimPaymentEvent(eventId) {
+  if (eventId === undefined || eventId === null) return true;
+  const { rows } = await getPool().query(
+    `INSERT INTO processed_payments (event_id)
+     VALUES ($1)
+     ON CONFLICT (event_id) DO NOTHING
+     RETURNING event_id`,
+    [String(eventId)]
   );
   return rows.length > 0;
 }

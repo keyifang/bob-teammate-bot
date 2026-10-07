@@ -52,6 +52,7 @@ import {
   getCreditBalance,
   addCredits,
   getCreditLedger,
+  claimPaymentEvent,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
@@ -70,6 +71,13 @@ import { renderDocumentHtml, safeFileName } from "./document.js";
 import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
 import { getFormat, defaultFormat, fileNameFor } from "./export.js";
 import { renderPdfBuffer } from "./pdf.js";
+import {
+  paymentsConfigured,
+  verifyStripeSignature,
+  parseStripeEvent,
+  creditForCheckout,
+  createCheckoutSession,
+} from "./payment.js";
 import {
   parseCommand,
   parseCallback,
@@ -175,7 +183,13 @@ bot
 const relayTurns = createTurnRegistry();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+// The Stripe webhook is excluded from the JSON parser on purpose. Its
+// signature is computed over the EXACT bytes Stripe sent, so re-serialising the
+// parsed object changes the bytes and every genuine webhook fails
+// verification. It installs its own express.raw() instead.
+app.use((req, res, next) =>
+  req.path === "/stripe-webhook" ? next() : express.json({ limit: "1mb" })(req, res, next)
+);
 
 function log(chatId, message) {
   console.log(`[chat ${chatId}] ${message}`);
@@ -1242,12 +1256,35 @@ async function handleCallbackQuery(query) {
   if (cb.action === "buy") {
     const pack = CREDIT_PACKS.find((p) => p.id === cb.pack);
     await ack(`Selected ${pack.label}`);
-    // No payment provider is wired yet, and inventing a fake "paid" state would
-    // hand out credit nobody paid for. This states the real situation.
-    await sendFormatted(
-      chatId,
-      `You picked the ${pack.label} pack (${formatUsd(creditsForPack(pack))} of credit). Card payment isn't connected on this deployment yet - nothing has been charged.`
-    );
+
+    if (!paymentsConfigured()) {
+      // Saying so is the honest answer; the alternative is a button that
+      // appears to work and grants credit nobody paid for.
+      await sendFormatted(
+        chatId,
+        `You picked the ${pack.label} pack (${formatUsd(creditsForPack(pack))} of credit). ` +
+          "Card payment isn't configured on this deployment, so nothing has been charged."
+      );
+      return;
+    }
+
+    // The redirect only tells the user to come back. Credit is granted by the
+    // signature-verified webhook, never by this URL.
+    try {
+      const session = await createCheckoutSession({
+        packId: pack.id,
+        userId,
+        successUrl: "https://t.me",
+        cancelUrl: "https://t.me",
+      });
+      await sendFormatted(
+        chatId,
+        `Tap to pay ${pack.label} for ${formatUsd(creditsForPack(pack))} of credit:\n${session.url}`
+      );
+    } catch (err) {
+      console.error("Checkout session failed:", err.message);
+      await sendFormatted(chatId, "Couldn't start the payment - try again in a moment.");
+    }
     return;
   }
 
@@ -1559,6 +1596,51 @@ app.post("/telegram-webhook", async (req, res) => {
     return;
   }
   await enqueueForChat(chatId, () => handleUpdate(update));
+});
+
+// Stripe webhook. Credit is granted ONLY here, and only after the signature
+// verifies - the browser redirect is never trusted to grant anything.
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!paymentsConfigured()) {
+    // Configured off is not an error the caller can fix; say so plainly rather
+    // than accepting an event we cannot verify.
+    return res.status(503).send("payments are not configured");
+  }
+
+  const body = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";
+  const check = verifyStripeSignature(body, req.header("Stripe-Signature"), secret);
+  if (!check.ok) {
+    console.error(`Stripe webhook rejected: ${check.error}`);
+    return res.status(400).send("invalid signature");
+  }
+
+  const event = parseStripeEvent(body);
+  if (!event?.type) return res.status(400).send("unparseable event");
+
+  // Only this event grants credit. Anything else is acknowledged and ignored,
+  // so Stripe stops retrying it.
+  if (event.type !== "checkout.session.completed") return res.sendStatus(200);
+
+  // Claim the event id first, so a Stripe retry cannot double-credit.
+  const claimed = await claimPaymentEvent(event.id);
+  if (!claimed) {
+    log("stripe", `duplicate payment event ${event.id} ignored`);
+    return res.sendStatus(200);
+  }
+
+  const credit = creditForCheckout(event.pack);
+  const userId = Number(event.userId);
+  if (!credit || !Number.isFinite(userId)) {
+    // Acknowledged so Stripe stops retrying, but logged loudly: this is a
+    // mismatch between our pack table and the session metadata.
+    console.error(`Stripe event ${event.id}: unknown pack "${event.pack}" or user "${event.userId}"`);
+    return res.sendStatus(200);
+  }
+
+  await addCredits(userId, credit, `purchase:${event.pack}`);
+  log("stripe", `credited user ${userId} for pack ${event.pack}`);
+  res.sendStatus(200);
 });
 
 app.get("/health", (_req, res) => res.send("ok"));
