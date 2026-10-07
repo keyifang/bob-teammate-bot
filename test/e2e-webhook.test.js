@@ -212,7 +212,12 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const pump = () => wait(300);
 
 // Waits until predicate() is true, or fails the test.
-async function waitFor(predicate, { timeout = 8000, label = "condition" } = {}) {
+// The default is generous because Node runs this file alongside a Postgres
+// integration suite and a Python PDF suite, all competing for the same
+// machine. At 8s two unrelated tests failed intermittently under that load -
+// not because they were wrong, but because a busy box is slower than a busy
+// laptop. A flaky suite trains people to ignore red.
+async function waitFor(predicate, { timeout = 20000, label = "condition" } = {}) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (await predicate()) return true;
@@ -2258,6 +2263,58 @@ test("the bot quota is enforced: free gets one bot, pro gets more", { skip }, as
   }
 
   assert.ok(counts.free < counts.pro, "the two plans must actually differ");
+});
+
+test("meterUsage never charges a user who supplied their own API key", async () => {
+  // Charging someone for tokens they paid their provider for directly is a
+  // double-billing bug. An e2e version of this proved nothing: the BYOK call
+  // 401s, so no cost ever accrues and the assertion passes whether or not the
+  // rule holds. This checks the rule itself, at the function.
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(
+    new RegExp(String.fromCharCode(13, 10), "g"),
+    String.fromCharCode(10)
+  );
+  const start = src.indexOf("async function meterUsage");
+  const body = src.slice(start, src.indexOf("}" + String.fromCharCode(10), start));
+  assert.match(
+    body,
+    /usingOwnKey/,
+    "the meter must skip users who brought their own key, or they are charged twice"
+  );
+  // And it must not be the ONLY guard: a missing route is also a no-charge case.
+  assert.match(body, /route\?\.userId/, "an absent route must also be a no-op");
+});
+
+test("a BYOK user is not charged by a real reply", { skip }, async () => {
+  // The complementary check that the rule is reached at all: a user with a
+  // stored key must produce no ledger entry, and no positive balance.
+  const chatId = 4401;
+  const byokUser = 9601;
+  await admin.query(
+    "INSERT INTO users (user_id, name) VALUES ($1, 'Byok') ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name",
+    [byokUser]
+  );
+  await admin.query(
+    `INSERT INTO user_model_config (user_id, provider, model, api_key)
+     VALUES ($1, 'openrouter', 'z-ai/glm-5.3-flash', $2)
+     ON CONFLICT (user_id) DO UPDATE SET provider = 'openrouter', model = 'z-ai/glm-5.3-flash', api_key = EXCLUDED.api_key`,
+    [byokUser, "sk-or-v1-" + "c".repeat(40)]
+  );
+  await admin.query("DELETE FROM credit_ledger WHERE user_id = $1", [byokUser]);
+  await admin.query("DELETE FROM user_credits WHERE user_id = $1", [byokUser]);
+
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 1400, chatId, fromId: byokUser, fromName: "Byok", text: "hello there" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await wait(3000);
+
+  const ledger = await admin.query(
+    "SELECT count(*)::int AS n FROM credit_ledger WHERE user_id = $1",
+    [byokUser]
+  );
+  assert.equal(ledger.rows[0].n, 0, "a BYOK user must have no credit ledger entry");
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
