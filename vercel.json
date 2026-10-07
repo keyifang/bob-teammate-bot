@@ -1,0 +1,31 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/webhook.js",
+      "use": "@vercel/node",
+      "config": {
+        "maxDuration": 300
+      }
+    }
+  ],
+  "routes": [
+    { "src": "/health", "dest": "/api/webhook.js" },
+    { "src": "/telegram-webhook", "dest": "/api/webhook.js" }
+  ],
+  "env": {
+    "DATABASE_URL": "@bob-database-url",
+    "TELEGRAM_BOT_TOKEN": "@bob-telegram-token",
+    "MODEL_API_KEY": "@bob-model-api-key",
+    "WEBHOOK_SECRET": "@bob-webhook-secret",
+    "MODEL_API_URL": "https://openrouter.ai/api/v1/chat/completions",
+    "MODEL_NAME": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "BOB_NAME": "Bob",
+    "HUMANIZE": "true",
+    "RECENT_MESSAGE_WINDOW": "10",
+    "SUMMARY_TRIGGER_BUFFER": "30",
+    "RELAY_MAX_BOTS": "3",
+    "PGPOOL_MAX": "5"
+  }
+}

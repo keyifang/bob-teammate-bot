@@ -1,4 +1,6 @@
 import "./env.js"; // must precede every module that reads process.env on load
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import {
@@ -1478,13 +1480,39 @@ app.post("/telegram-webhook", async (req, res) => {
 
 app.get("/health", (_req, res) => res.send("ok"));
 
-ensureSchema()
-  .then(() =>
-    app.listen(Number(PORT ?? 3000), () =>
-      console.log(`Bob running on port ${PORT ?? 3000}`)
+// The app is exported so a serverless entry point (api/webhook.js on Vercel)
+// can reuse THE SAME routes rather than forking them. A second implementation
+// would drift, and the webhook is exactly the code that must not.
+export { app };
+
+// Schema bootstrap, run once per process. On serverless this runs on a cold
+// start; ensureSchema is idempotent, so a warm instance re-running it is safe.
+let schemaReady = null;
+export function ensureSchemaReady() {
+  if (!schemaReady) {
+    schemaReady = ensureSchema().catch((err) => {
+      // Reset so a later invocation retries instead of caching the failure.
+      schemaReady = null;
+      throw err;
+    });
+  }
+  return schemaReady;
+}
+
+// Only a long-lived process listens on a port. Importing this module (which is
+// what the serverless entry does) must not bind one.
+const isDirectRun =
+  process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
+if (isDirectRun) {
+  ensureSchemaReady()
+    .then(() =>
+      app.listen(Number(PORT ?? 3000), () =>
+        console.log(`Bob running on port ${PORT ?? 3000}`)
+      )
     )
-  )
-  .catch((err) => {
-    console.error("Failed to initialize database schema:", err.message);
-    process.exit(1);
-  });
+    .catch((err) => {
+      console.error("Failed to initialize database schema:", err.message);
+      process.exit(1);
+    });
+}

@@ -19,10 +19,16 @@ RUN apt-get update \
 # --break-system-packages is required because PEP 668 marks the system
 # environment as externally managed. The build needs build-essential because
 # some transitive wheels have no prebuilt build.
+# reportlab renders the PDF export. It is pure Python with no system libraries,
+# which is why it is used instead of WeasyPrint - WeasyPrint needs
+# Pango/cairo/GTK, and those are deliberately absent from this slim image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir --break-system-packages "httpx>=0.28" "ddgs>=9"
+    && pip install --no-cache-dir --break-system-packages \
+        "httpx>=0.28" \
+        "ddgs>=9" \
+        "reportlab>=4"
 
 WORKDIR /app
 
