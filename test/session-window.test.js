@@ -12,6 +12,8 @@ import {
   selectWindow,
   summariseTriggered,
   orderForCache,
+  estimateTokens,
+  tokenTriggered,
   DEFAULT_TURNS,
   TURNS_PER_SUMMARY,
 } from "../session-window.js";
@@ -64,6 +66,39 @@ test("summarisation does not re-trigger on every single message", () => {
   assert.equal(TURNS_PER_SUMMARY, 30);
   assert.equal(summariseTriggered(29, TURNS_PER_SUMMARY), false);
   assert.equal(summariseTriggered(30, TURNS_PER_SUMMARY), true);
+});
+
+test("a token estimate catches the long-message case a count would miss", () => {
+  // 40 messages is the count trigger, but a chat of 8 very long messages blows
+  // the context budget long before 40 rows exist. The token guard is the second
+  // independent signal, so the window stays bounded either way.
+  assert.ok(estimateTokens("hello world") > 0);
+  const short = Array.from({ length: 8 }, () => "ok");
+  const long = Array.from({ length: 8 }, () => "x".repeat(2000));
+  assert.ok(
+    estimateTokens(long.join("\n")) > estimateTokens(short.join("\n")) * 10,
+    "a long body must estimate far more tokens than a short one"
+  );
+});
+
+test("estimateTokens is a safe over-estimate, never an under-estimate", () => {
+  // Under-estimating is the dangerous direction: the request would exceed the
+  // model's context and fail, rather than summarising early.
+  const text = "a".repeat(100);
+  // ~4 chars per token is the usual rule; the estimate must be at least that.
+  assert.ok(estimateTokens(text) >= 25, `100 chars estimated at ${estimateTokens(text)} tokens`);
+});
+
+test("the token trigger fires on a long body even when the count is low", () => {
+  const budget = 1000;
+  assert.equal(tokenTriggered("x".repeat(100), budget), false);
+  assert.equal(tokenTriggered("x".repeat(100000), budget), true);
+});
+
+test("an unset or nonsense token budget disables the guard rather than misfiring", () => {
+  assert.equal(tokenTriggered("x".repeat(100000), 0), false);
+  assert.equal(tokenTriggered("x".repeat(100000), NaN), false);
+  assert.equal(tokenTriggered("x".repeat(100000), -5), false);
 });
 
 test("prompt order is stable-first, so the cacheable prefix does not move", () => {

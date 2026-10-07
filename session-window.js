@@ -32,6 +32,35 @@ export function summariseTriggered(pendingCount, batch = TURNS_PER_SUMMARY) {
   return n >= b;
 }
 
+// A rough token count, deliberately an OVER-estimate. Under-estimating is the
+// dangerous direction: the request would exceed the model's context and fail,
+// rather than summarising early. ~4 characters per token is the usual rule for
+// English; 3.5 is used so the estimate errs high.
+export function estimateTokens(text) {
+  const len = String(text ?? "").length;
+  return Math.ceil(len / 3.5);
+}
+
+// The second, independent guard. A chat of a few very long messages blows the
+// context budget long before the message-count trigger fires, so this catches
+// what the count cannot. An unset or nonsense budget disables the guard rather
+// than misfiring on every message.
+export function tokenTriggered(text, budgetTokens) {
+  const budget = Number(budgetTokens);
+  if (!Number.isFinite(budget) || budget <= 0) return false;
+  return estimateTokens(text) >= budget;
+}
+
+// 15% of the model's context window, per the plan: message count bounds cost
+// deterministically, and this catches a chat whose rows are individually huge.
+export const CONTEXT_TRIGGER_RATIO = 0.15;
+
+export function tokenBudgetFor(contextWindow) {
+  const w = Number(contextWindow);
+  if (!Number.isFinite(w) || w <= 0) return 0;
+  return Math.floor(w * CONTEXT_TRIGGER_RATIO);
+}
+
 // Stable-first ordering. Everything that changes per message goes last, so the
 // prefix stays byte-identical between calls and the provider's cache can hit.
 export function orderForCache({ persona, ownerSummary, sessionSummary, turns, latest }) {

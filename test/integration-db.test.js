@@ -422,6 +422,94 @@ test("getBotsForChat returns every relay participant in position order", { skip 
   assert.ok(bots.every((b) => b.display_name), "each row must carry its display name");
 });
 
+// --- Per-bot summarisation --------------------------------------------------
+//
+// A bot's memory has to prune like the chat's does, or bot_messages grows
+// forever and the persona prompt silently loses everything older than its
+// window. These pin the same write-first-delete-second property the chat-level
+// path has: a failure between the two leaves the text recoverable.
+
+const BOT_SUM = 880000001;
+const BOT_CHAT = 880000002;
+
+async function seedBotForSummary() {
+  await db.upsertUser(OWNER_1, "Owner One");
+  await db.getOrCreateChat(BOT_CHAT, "Summary chat");
+  return db.createBot({
+    ownerUserId: OWNER_1,
+    telegramUserId: null,
+    displayName: `SumBot${BOT_SUM}`,
+  });
+}
+
+test("getBotMessagesToSummarize keeps the newest and returns the oldest first", { skip }, async () => {
+  const bot = await seedBotForSummary();
+  const texts = ["b1", "b2", "b3", "b4", "b5", "b6"];
+  for (const t of texts) await db.insertBotMessage(bot.bot_id, BOT_CHAT, "Human", t);
+
+  const toSum = await db.getBotMessagesToSummarize(bot.bot_id, BOT_CHAT, 2);
+  assert.equal(toSum.length, 4, "must leave exactly 2 behind");
+
+  const ids = toSum.map((r) => Number(r.id));
+  assert.deepEqual(ids, [...ids].sort((a, b) => a - b), "oldest first");
+  assert.equal(new Set(ids).size, ids.length, "no duplicates");
+
+  // The 2 kept must be the newest.
+  const kept = await db.getRecentBotMessages(bot.bot_id, BOT_CHAT, 2);
+  assert.deepEqual(kept.map((m) => m.text), ["b5", "b6"]);
+  for (const row of kept) {
+    assert.ok(!toSum.some((s) => s.text === row.text), `${row.text} was kept and summarised`);
+  }
+});
+
+test("getBotMessagesToSummarize is scoped to one bot, so another bot is untouched", { skip }, async () => {
+  const a = await seedBotForSummary();
+  const b = await seedBotForSummary();
+  for (let i = 0; i < 5; i++) await db.insertBotMessage(a.bot_id, BOT_CHAT, "Human", `a${i}`);
+  await db.insertBotMessage(b.bot_id, BOT_CHAT, "Human", "b-only");
+
+  await db.getBotMessagesToSummarize(a.bot_id, BOT_CHAT, 1);
+  assert.equal(await db.getBotMessageCount(b.bot_id, BOT_CHAT), 1, "bot B must be untouched");
+});
+
+test("getBotMessagesToSummarize returns nothing under the keep threshold", { skip }, async () => {
+  const bot = await seedBotForSummary();
+  await db.insertBotMessage(bot.bot_id, BOT_CHAT, "Human", "only");
+  assert.deepEqual(await db.getBotMessagesToSummarize(bot.bot_id, BOT_CHAT, 10), []);
+});
+
+test("deleteBotMessagesByIds removes exactly those rows and no-ops on empty", { skip }, async () => {
+  const bot = await seedBotForSummary();
+  for (let i = 0; i < 5; i++) await db.insertBotMessage(bot.bot_id, BOT_CHAT, "Human", `d${i}`);
+
+  const before = await db.getBotMessageCount(bot.bot_id, BOT_CHAT);
+  await db.deleteBotMessagesByIds(bot.bot_id, []);
+  assert.equal(await db.getBotMessageCount(bot.bot_id, BOT_CHAT), before, "empty delete is a no-op");
+
+  const rows = await db.getBotMessagesToSummarize(bot.bot_id, BOT_CHAT, 2);
+  await db.deleteBotMessagesByIds(bot.bot_id, rows.map((r) => Number(r.id)));
+  assert.equal(await db.getBotMessageCount(bot.bot_id, BOT_CHAT), 2);
+});
+
+test("deleteBotMessagesByIds cannot delete another bot's rows", { skip }, async () => {
+  // The delete takes ids, so a caller could pass an id belonging to another bot
+  // if the query were not scoped. It is scoped by bot_id.
+  const a = await seedBotForSummary();
+  const b = await seedBotForSummary();
+  await db.insertBotMessage(a.bot_id, BOT_CHAT, "Human", "a-row");
+  await db.insertBotMessage(b.bot_id, BOT_CHAT, "Human", "b-row");
+
+  const { rows } = await admin.query(
+    "SELECT id FROM bot_messages WHERE bot_id = $1",
+    [b.bot_id]
+  );
+  await db.deleteBotMessagesByIds(a.bot_id, [Number(rows[0].id)]);
+  assert.equal(await db.getBotMessageCount(b.bot_id, BOT_CHAT), 1, "bot B must survive");
+
+  await db.deleteBotMessagesByIds(b.bot_id, [Number(rows[0].id)]);
+  assert.equal(await db.getBotMessageCount(b.bot_id, BOT_CHAT), 0, "and be deletable by its owner");
+});
+
 // Phase 8: subscriptions. Billing state is stored, and a missing row is a
 // valid state meaning "free" - never an error, because a billing hiccup must
 // not take a working bot offline.

@@ -477,6 +477,30 @@ export async function getBotMessageCount(botId, chatId) {
   return rows[0].count;
 }
 
+// The bot equivalent of getMessagesToSummarize. Oldest-first so the batch
+// reads as a conversation, and bounded by the same "keep the newest N" rule.
+export async function getBotMessagesToSummarize(botId, chatId, keepLast) {
+  const { rows } = await getPool().query(
+    `SELECT id, sender, text FROM bot_messages
+      WHERE bot_id = $1 AND chat_id = $2
+      ORDER BY created_at ASC, id ASC
+      LIMIT (SELECT GREATEST(COUNT(*) - $3, 0) FROM bot_messages
+               WHERE bot_id = $1 AND chat_id = $2)`,
+    [botId, chatId, keepLast]
+  );
+  return rows;
+}
+
+// Scoped by bot_id as well as id, so a caller cannot delete another bot's rows
+// by passing an id it happens to know.
+export async function deleteBotMessagesByIds(botId, ids) {
+  if (!ids.length) return;
+  await getPool().query(
+    `DELETE FROM bot_messages WHERE bot_id = $1 AND id = ANY($2::bigint[])`,
+    [botId, ids]
+  );
+}
+
 export async function getBotSummary(botId, chatId) {
   const { rows } = await getPool().query(
     `SELECT summary FROM bot_summaries WHERE bot_id = $1 AND chat_id = $2`,

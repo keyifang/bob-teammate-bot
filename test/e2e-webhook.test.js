@@ -536,7 +536,7 @@ test("Phase 3: a named bot answers when called by name", { skip }, async () => {
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2 AND sender <> 'Human'",
         [botId, chatId]
       );
       return rows[0].n > 0;
@@ -590,7 +590,7 @@ test("Phase 3: the relay does not answer a message addressed to a named bot", { 
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2 AND sender <> 'Human'",
         [botId, chatId]
       );
       return rows[0].n > 0;
@@ -637,7 +637,7 @@ test("Phase 3: a bot with no model tier falls back to the deployment default", {
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2 AND sender <> 'Human'",
         [botId, chatId]
       );
       return rows[0].n > 0;
@@ -690,7 +690,8 @@ test("Phase 5: two named bots answer in sequence, the second seeing the first", 
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1 AND bot_id = ANY($2::bigint[])",
+        `SELECT count(*)::int AS n FROM bot_messages
+          WHERE chat_id = $1 AND bot_id = ANY($2::bigint[]) AND sender <> 'Human'`,
         [chatId, [aliceId, carolId]]
       );
       return rows[0].n >= 2;
@@ -777,8 +778,11 @@ test("Phase 5: a human interjection stops the bots still waiting to speak", { sk
   // would let this test pass while cancellation was entirely broken.
   await wait(12000);
 
+  // Bot-authored rows only: the human's message is recorded per persona, so
+  // counting every row would make three bots look like six.
   const { rows } = await admin.query(
-    "SELECT sender FROM bot_messages WHERE chat_id = $1 ORDER BY id",
+    `SELECT sender FROM bot_messages
+      WHERE chat_id = $1 AND sender <> 'Human' ORDER BY id`,
     [chatId]
   );
   assert.ok(
@@ -843,7 +847,7 @@ test("Phase 6: a bot carries its owner memory from one group into another", { sk
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2 AND sender <> 'Human'",
         [botId, chatB]
       );
       return rows[0].n > 0;
@@ -901,7 +905,7 @@ test("Phase 6: two owners' bots never see each other's memory", { skip }, async 
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1 AND chat_id = $2 AND sender <> 'Human'",
         [ownerTwoBot, chatId]
       );
       return rows[0].n > 0;
@@ -1397,16 +1401,192 @@ test("a tampered callback cannot select an unregistered model", { skip }, async 
   );
 });
 
+// --- Per-bot summarisation --------------------------------------------------
+//
+// Without this loop a bot's memory grows forever and its summary stays empty,
+// so the persona prompt silently loses everything older than its window.
+
+test("a bot's history is summarised and pruned once it exceeds the window", { skip }, async () => {
+  calls = [];
+  const chatId = 3701;
+  const botId = await seedNamedBot(chatId, {
+    ownerUserId: 850,
+    displayName: "Pruner",
+    modelTier: "pruner:free",
+    relayPosition: 0,
+  });
+
+  // Seed well past the summarisation threshold directly, then trigger the loop
+  // with one real message - the same shape the chat-level path uses.
+  await admin.query(
+    `INSERT INTO bot_messages (bot_id, chat_id, sender, text)
+     SELECT $1, $2, 'Human', 'old ' || g FROM generate_series(1, 40) g`,
+    [botId, chatId]
+  );
+  const before = await admin.query(
+    "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1",
+    [botId]
+  );
+  assert.equal(before.rows[0].n, 40);
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 900,
+      chatId,
+      fromId: 851,
+      fromName: "Human",
+      text: "@Pruner one more thing",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // The summary must be written and the old rows pruned.
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT summary FROM bot_summaries WHERE bot_id = $1 AND chat_id = $2",
+        [botId, chatId]
+      );
+      return rows.length === 1 && rows[0].summary.length > 0;
+    },
+    { label: "bot summary written", timeout: 20000 }
+  );
+
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1",
+    [botId]
+  );
+  assert.ok(
+    Number(rows[0].n) < 40,
+    `old rows must be pruned after summarising, still have ${rows[0].n}`
+  );
+  assert.ok(
+    Number(rows[0].n) > 0,
+    "the newest rows must survive, or the bot loses its recent context"
+  );
+});
+
+test("summarising one bot does not touch another bot's history", { skip }, async () => {
+  const chatId = 3702;
+  const aId = await seedNamedBot(chatId, {
+    ownerUserId: 852,
+    displayName: "Alpha",
+    modelTier: "alpha:free",
+    relayPosition: 0,
+  });
+  const bId = await seedNamedBot(chatId, {
+    ownerUserId: 852,
+    displayName: "Beta",
+    modelTier: "beta:free",
+    relayPosition: 1,
+  });
+
+  await admin.query(
+    `INSERT INTO bot_messages (bot_id, chat_id, sender, text)
+     SELECT $1, $2, 'Human', 'alpha ' || g FROM generate_series(1, 40) g`,
+    [aId, chatId]
+  );
+  await admin.query(
+    `INSERT INTO bot_messages (bot_id, chat_id, sender, text)
+     VALUES ($1, $2, 'Human', 'beta-only')`,
+    [bId, chatId]
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 901, chatId, fromId: 853, fromName: "Human", text: "@Alpha hello" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1",
+        [aId]
+      );
+      return Number(rows[0].n) < 40;
+    },
+    { label: "Alpha pruned", timeout: 20000 }
+  );
+
+  const bRows = await admin.query(
+    "SELECT count(*)::int AS n FROM bot_messages WHERE bot_id = $1",
+    [bId]
+  );
+  assert.equal(Number(bRows.rows[0].n), 1, "Beta's single row must be untouched");
+
+  // And Beta must not have gained a summary from Alpha's history.
+  const bSum = await admin.query(
+    "SELECT summary FROM bot_summaries WHERE bot_id = $1 AND chat_id = $2",
+    [bId, chatId]
+  );
+  assert.equal(bSum.rows.length, 0, "Beta must not inherit Alpha's summary");
+});
+
+test("the persona prompt actually receives the written summary", { skip }, async () => {
+  // The db and the prompt were both correct before; the loop that CONNECTS them
+  // was missing, so the summary was always empty at runtime. This asserts the
+  // connection, not the parts.
+  calls = [];
+  const chatId = 3703;
+  const botId = await seedNamedBot(chatId, {
+    ownerUserId: 854,
+    displayName: "Rememberer",
+    modelTier: "rememberer:free",
+    relayPosition: 0,
+  });
+
+  await admin.query(
+    `INSERT INTO bot_summaries (bot_id, chat_id, summary)
+     VALUES ($1, $2, 'SUMMARY_MARKER_the_budget_was_1200')
+     ON CONFLICT (bot_id, chat_id) DO UPDATE SET summary = EXCLUDED.summary`,
+    [botId, chatId]
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 902,
+      chatId,
+      fromId: 855,
+      fromName: "Human",
+      text: "@Rememberer what was the budget?",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => calls.some((c) => c.body.model === "rememberer:free"), {
+    label: "a persona call",
+    timeout: 20000,
+  });
+  const call = calls.find((c) => c.body.model === "rememberer:free");
+  const prompt = call.body.messages.map((m) => m.content).join("\n");
+  assert.match(
+    prompt,
+    /SUMMARY_MARKER_the_budget_was_1200/,
+    "the stored summary must reach the prompt"
+  );
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(
-    "SELECT bot_id, sender, count(*)::int AS n FROM bot_messages WHERE chat_id = $1 GROUP BY bot_id, sender ORDER BY sender",
+    `SELECT bot_id, sender, count(*)::int AS n FROM bot_messages
+      WHERE chat_id = $1 AND sender <> 'Human'
+      GROUP BY bot_id, sender ORDER BY sender`,
     [chatId]
   );
   assert.equal(rows.length, 2, "each bot must have its own row set");
   for (const row of rows) {
     assert.equal(row.n, 1, `${row.sender} must hold exactly its own reply`);
   }
+  // The human's message is recorded per persona, so each bot's transcript
+  // includes what it was asked - otherwise it would only see its own replies.
+  const humanRows = await admin.query(
+    "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1 AND sender = 'Human'",
+    [chatId]
+  );
+  assert.ok(Number(humanRows.rows[0].n) >= 2, "the question must be recorded per persona");
   // No reply may be recorded against the relay's (chat_id-only) memory.
   const relayRows = await admin.query(
     "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
@@ -1447,7 +1627,7 @@ test("Phase 5: a relay turn is capped at the configured fan-out", { skip }, asyn
   await waitFor(
     async () => {
       const { rows } = await admin.query(
-        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1",
+        "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1 AND sender <> 'Human'",
         [chatId]
       );
       return rows[0].n >= 3;
@@ -1458,14 +1638,14 @@ test("Phase 5: a relay turn is capped at the configured fan-out", { skip }, asyn
   await pump();
 
   const { rows } = await admin.query(
-    "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1",
+    "SELECT count(*)::int AS n FROM bot_messages WHERE chat_id = $1 AND sender <> 'Human'",
     [chatId]
   );
   assert.equal(Number(rows[0].n), 3, `fan-out must be capped at 3, got ${rows[0].n}`);
 
   // The cap must keep the FIRST bots by relay position, not an arbitrary set.
   const { rows: spoke } = await admin.query(
-    "SELECT sender FROM bot_messages WHERE chat_id = $1 ORDER BY id",
+    "SELECT sender FROM bot_messages WHERE chat_id = $1 AND sender <> 'Human' ORDER BY id",
     [chatId]
   );
   assert.deepEqual(spoke.map((r) => r.sender), ["P0", "P1", "P2"]);

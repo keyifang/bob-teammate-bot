@@ -38,7 +38,11 @@ import {
   getRecentBotMessages,
   getBotSummary,
   updateBotSummary,
+  updateBotOwnerMemory,
   getBotOwnerMemory,
+  getBotMessageCount,
+  getBotMessagesToSummarize,
+  deleteBotMessagesByIds,
   getSubscription,
   claimUpdate,
   pruneProcessedUpdates,
@@ -55,7 +59,13 @@ import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay } from "./bots.js";
 import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
-import { selectWindow, orderForCache, DEFAULT_TURNS } from "./session-window.js";
+import {
+  selectWindow,
+  orderForCache,
+  summariseTriggered,
+  DEFAULT_TURNS,
+  TURNS_PER_SUMMARY,
+} from "./session-window.js";
 import { renderDocumentHtml, safeFileName } from "./document.js";
 import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
 import { getFormat, defaultFormat, fileNameFor } from "./export.js";
@@ -743,6 +753,9 @@ async function runRelayTurn(chatId, senderId, senderName, text, personas, plan =
       return replies;
     }
 
+    // Recorded per persona, so each one's transcript includes what was asked.
+    await insertBotMessage(persona.bot_id, chatId, senderName, text);
+
     const discussion = buildDiscussionContext(replies);
     const prompt = await buildPersonaPrompt(persona, chatId, senderName, text, discussion);
     const spoken = await sendNamedBotReply(chatId, senderId, persona, prompt, { plan, route });
@@ -806,6 +819,70 @@ async function summarizeIfNeeded(chatId) {
   );
   await updateUserCrossChatSummary(owner.user_id, merged);
   log(chatId, `tier C updated for owner ${owner.name}`);
+}
+
+// The per-bot equivalent of summarizeIfNeeded. Without this, bot_messages
+// grows forever and the bot's summary stays empty - so the persona prompt
+// silently loses everything older than its window.
+//
+// Same property as the chat path: write the summary FIRST, delete SECOND, so a
+// failure between the two leaves the text recoverable rather than lost.
+async function summarizeBotIfNeeded(botId, chatId) {
+  const count = await getBotMessageCount(botId, chatId);
+  if (!summariseTriggered(count, TURNS_PER_SUMMARY)) return;
+
+  const toSummarize = await getBotMessagesToSummarize(botId, chatId, DEFAULT_TURNS);
+  if (!toSummarize.length) return;
+
+  const existing = await getBotSummary(botId, chatId);
+  const batch = toSummarize.map((m) => `${m.sender}: ${m.text}`).join("\n");
+
+  const prompt = [
+    `Existing summary:\n${existing || "(none yet)"}`,
+    `Older messages to fold in:\n${batch}`,
+  ].join("\n\n");
+
+  const updated = await callModel(
+    chatId,
+    SUMMARIZER_SYSTEM_PROMPT,
+    prompt,
+    SUMMARY_MAX_TOKENS,
+    "bot summarizer"
+  );
+
+  await updateBotSummary(botId, chatId, updated);
+  await deleteBotMessagesByIds(botId, toSummarize.map((m) => Number(m.id)));
+  log(chatId, `bot ${botId}: summarised ${toSummarize.length} messages and pruned them`);
+
+  // Tier C travels with the bot across groups, so it is folded from the session
+  // summary rather than from raw rows - the rows belong to one chat.
+  const ownerMemory = await getBotOwnerMemory(botId);
+  const chatTitle = await getChatTitle(chatId);
+  const crossPrompt = [
+    `Existing summary of everything you know:\n${ownerMemory || "(none yet)"}`,
+    `Update from the chat titled "${chatTitle || "untitled"}":\n${updated}`,
+  ].join("\n\n");
+  const merged = await callModel(
+    chatId,
+    CROSS_CHAT_SUMMARIZER_PROMPT,
+    crossPrompt,
+    SUMMARY_MAX_TOKENS,
+    "bot owner memory"
+  );
+  await updateBotOwnerMemory(botId, merged);
+  log(chatId, `bot ${botId}: owner memory updated`);
+}
+
+// Runs the per-bot pass for every bot in the chat. A failure for one bot must
+// not stop the others, so each is caught separately.
+async function summarizeBotsSafely(bots, chatId) {
+  for (const bot of bots) {
+    try {
+      await summarizeBotIfNeeded(bot.bot_id, chatId);
+    } catch (err) {
+      console.error(`Summarisation failed for bot ${bot.bot_id}:`, err.message);
+    }
+  }
 }
 
 // Wrapped so background callers log instead of emitting an unhandled rejection.
@@ -1331,12 +1408,17 @@ async function handleUpdate(update) {
     // the bots answer in sequence seeing each other, rather than posting N
     // unrelated replies.
     if (personas.length === 1) {
+      // The human's message is recorded against the persona's own memory, or
+      // its transcript would contain only its own replies - it would never see
+      // what it was actually asked.
+      await insertBotMessage(personas[0].bot_id, chatId, senderName, cleaned);
       const prompt = await buildPersonaPrompt(personas[0], chatId, senderName, cleaned, "");
       await sendNamedBotReply(chatId, sender.id, personas[0], prompt, {
         plan: personaPlan,
         route: await routeForUser(personas[0].owner_user_id, sessionIdFor(personas[0].bot_id, chatId)),
       });
       summarizeSafely(chatId);
+      summarizeBotsSafely(personas, chatId);
       return;
     }
 
@@ -1356,6 +1438,7 @@ async function handleUpdate(update) {
       console.error(`Relay turn failed for chat ${chatId}:`, err.message)
     );
     summarizeSafely(chatId);
+    summarizeBotsSafely(personas, chatId);
     return;
   }
 
