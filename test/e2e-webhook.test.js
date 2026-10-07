@@ -1877,6 +1877,67 @@ test("PDF degrades to HTML where Python is unavailable, instead of failing", { s
   assert.ok(html && !html.needsProcess, "the fallback must not need a subprocess");
 });
 
+test("a chat of few but very long messages summarises on size, not on count", { skip }, async () => {
+  // The count trigger needs 40 rows. A chat of 8 enormous messages never gets
+  // there but still blows the context budget, which is exactly the case the
+  // token guard exists for.
+  const chatId = 3704;
+  const huge = "x".repeat(200000); // ~57k tokens each
+
+  // messages.chat_id is a foreign key, so the chat must exist first.
+  await admin.query(
+    "INSERT INTO chats (chat_id, title) VALUES ($1, $2) ON CONFLICT (chat_id) DO NOTHING",
+    [chatId, "Long messages"]
+  );
+
+  for (let i = 0; i < 8; i++) {
+    await admin.query(
+      "INSERT INTO messages (chat_id, user_id, sender, text) VALUES ($1, $2, 'Human', $3)",
+      [chatId, 899, huge]
+    );
+  }
+  const before = await admin.query(
+    "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+    [chatId]
+  );
+  assert.equal(before.rows[0].n, 8, "only 8 rows - well under the count trigger");
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 903,
+      chatId,
+      fromId: 899,
+      fromName: "Human",
+      text: `@${BOT_USERNAME} summarise please`,
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // It must summarise even though the count is far below the threshold.
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT summary FROM chats WHERE chat_id = $1 AND summary <> ''",
+        [chatId]
+      );
+      return rows.length === 1;
+    },
+    { label: "summarised on size", timeout: 60000 }
+  );
+
+  // The trigger message itself is also persisted, so the count is measured
+  // against the 8 seeded rows plus that one, not against 8.
+  const after = await admin.query(
+    "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+    [chatId]
+  );
+  assert.ok(
+    Number(after.rows[0].n) <= 2,
+    `the 8 enormous messages must be pruned once summarised, still have ${after.rows[0].n}`
+  );
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(

@@ -64,6 +64,8 @@ import {
   selectWindow,
   orderForCache,
   summariseTriggered,
+  tokenTriggered,
+  tokenBudgetFor,
   DEFAULT_TURNS,
   TURNS_PER_SUMMARY,
 } from "./session-window.js";
@@ -814,17 +816,66 @@ async function runRelayTurn(chatId, senderId, senderName, text, personas, plan =
   return replies;
 }
 
+// The plan's rule: min(message count, 15% of the context window).
+//
+// Two independent triggers, because they catch different failures. The count
+// bounds cost deterministically. The token estimate catches a chat of a few
+// VERY long messages, which never reaches a row count but still blows the
+// context budget. Either can fire.
+//
+// Returns WHICH one fired, because they lead to different pruning: the size
+// trigger has to fold in more aggressively, or a single huge message stays over
+// budget after being summarised.
+function summariseTrigger({ count, text, batch, contextWindow }) {
+  const countFires = summariseTriggered(count, batch);
+  const sizeFires = tokenTriggered(text, tokenBudgetFor(contextWindow));
+  if (countFires) return "count";
+  if (sizeFires) return "size";
+  return null;
+}
+
+// Shared so both loops cannot drift apart on what "too much" means.
+function shouldSummarise(args) {
+  return summariseTrigger(args) !== null;
+}
+
+// The context window of the model this deployment runs on. Every registered
+// model is at least 256k; this is the conservative floor, so the guard fires
+// early rather than late.
+const DEFAULT_CONTEXT_WINDOW = 262144;
+
 async function summarizeIfNeeded(chatId) {
   const count = await getMessageCount(chatId);
-  if (count < TRIGGER_AT) return;
 
-  const toSummarize = await getMessagesToSummarize(chatId, KEEP_LAST);
+  // Measured over the WHOLE retained history, not just the batch: a chat of a
+  // few enormous messages has fewer rows than KEEP_LAST, so measuring only the
+  // batch would report zero and the size guard could never fire.
+  const retained = await getRecentMessages(chatId, KEEP_LAST);
+  const retainedText = retained.map((m) => `${m.sender}: ${m.text}`).join("\n");
+
+  const contextWindow = Number(process.env.CONTEXT_WINDOW_TOKENS ?? DEFAULT_CONTEXT_WINDOW);
+  const trigger = summariseTrigger({
+    count,
+    text: retainedText,
+    batch: TRIGGER_AT,
+    contextWindow,
+  });
+  if (!trigger) return;
+
+  // The size guard folds in EVERYTHING but the newest turn. One message at a
+  // time does not converge: a single huge message is still over budget after
+  // it is summarised, so the loop would re-fire on every subsequent message.
+  // The newest turn stays because that is the one being answered.
+  const keep = trigger === "size" ? 1 : KEEP_LAST;
+
+  const toSummarize = await getMessagesToSummarize(chatId, keep);
   if (!toSummarize.length) return;
 
-  const existingSummary = await getChatSummary(chatId);
   const batchTranscript = toSummarize
     .map((m) => `${m.sender}: ${m.text}`)
     .join("\n");
+
+  const existingSummary = await getChatSummary(chatId);
 
   const prompt = [
     `Existing summary:\n${existingSummary ? existingSummary : "(none yet)"}`,
@@ -877,13 +928,29 @@ async function summarizeIfNeeded(chatId) {
 // failure between the two leaves the text recoverable rather than lost.
 async function summarizeBotIfNeeded(botId, chatId) {
   const count = await getBotMessageCount(botId, chatId);
-  if (!summariseTriggered(count, TURNS_PER_SUMMARY)) return;
 
-  const toSummarize = await getBotMessagesToSummarize(botId, chatId, DEFAULT_TURNS);
+  // Measured over the retained history, for the same reason as the chat loop:
+  // a bot with fewer rows than DEFAULT_TURNS would report a zero batch, and the
+  // size guard could never fire.
+  const retained = await getRecentBotMessages(botId, chatId, DEFAULT_TURNS);
+  const retainedText = retained.map((m) => `${m.sender}: ${m.text}`).join("\n");
+
+  const trigger = summariseTrigger({
+    count,
+    text: retainedText,
+    batch: TURNS_PER_SUMMARY,
+    contextWindow: Number(process.env.CONTEXT_WINDOW_TOKENS ?? DEFAULT_CONTEXT_WINDOW),
+  });
+  if (!trigger) return;
+
+  // Same aggressive prune as the chat loop: keep only the newest turn.
+  const keep = trigger === "size" ? 1 : DEFAULT_TURNS;
+  const toSummarize = await getBotMessagesToSummarize(botId, chatId, keep);
   if (!toSummarize.length) return;
 
-  const existing = await getBotSummary(botId, chatId);
   const batch = toSummarize.map((m) => `${m.sender}: ${m.text}`).join("\n");
+
+  const existing = await getBotSummary(botId, chatId);
 
   const prompt = [
     `Existing summary:\n${existing || "(none yet)"}`,

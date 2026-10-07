@@ -93,3 +93,46 @@ test("the session id is derived per bot per chat, so two bots do not share a cac
   assert.match(body, /botId/, "the session id must include the bot");
   assert.match(body, /chatId/, "the session id must include the chat");
 });
+
+// The token guard must be WIRED, not merely implemented. These exist because
+// the function was written and unit-tested and then never called - the same
+// mistake the per-bot summarisation loop was caught making.
+const CRLF = new RegExp(String.fromCharCode(13, 10), "g");
+const LF = String.fromCharCode(10);
+const CLOSE = LF + "}" + LF;
+test("the token guard is actually called, not merely exported", async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(CRLF, LF);
+  assert.match(src, /tokenTriggered\(/, "the guard must be invoked somewhere");
+  assert.match(src, /tokenBudgetFor\(/, "a token budget must be derived");
+});
+
+// The decision lives in one helper used by both loops, so the two triggers
+// cannot drift apart between them. What matters is that each loop CALLS it.
+test("both summarisation loops route through the shared two-trigger decision", async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(CRLF, LF);
+  const calls = (src.match(/summariseTrigger\(/g) ?? []).length;
+  // One definition plus one call per loop.
+  assert.ok(calls >= 3, `expected the helper to be defined and called by both loops, found ${calls}`);
+
+  const helper = src.slice(src.indexOf("function summariseTrigger("));
+  const helperBody = helper.slice(0, helper.indexOf(CLOSE));
+  assert.match(helperBody, /summariseTriggered\(/, "the count trigger must be present");
+  assert.match(helperBody, /tokenTriggered\(/, "the token trigger must be present");
+});
+
+test("the size trigger prunes harder than the count trigger", async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(CRLF, LF);
+  // Folding in one message at a time never converges on a single huge message:
+  // it is still over budget after being summarised, so the guard would re-fire
+  // on every subsequent message.
+  const loops = ["summarizeIfNeeded", "summarizeBotIfNeeded"];
+  for (const name of loops) {
+    const body = src.slice(src.indexOf(`async function ${name}`));
+    const fn = body.slice(0, body.indexOf(CLOSE));
+    assert.match(
+      fn,
+      /trigger === "size" \? 1 :/,
+      `${name} must prune more aggressively when the size trigger fires`
+    );
+  }
+});
