@@ -37,6 +37,7 @@ let telegram = []; // recorded Telegram calls
 let stub;
 let stubPort;
 let admin;
+let db; // used by the lease test to take and release a lock directly
 let serverLog = [];
 // Model ids the stub should answer slowly. Used only by the interjection test,
 // which needs the relay turn to still be in flight when the human speaks -
@@ -257,6 +258,9 @@ before(async () => {
   stub = stubInfo.server;
   stubPort = stubInfo.port;
 
+  // The in-process db import needs the URL; the child gets it via spawn env.
+  process.env.DATABASE_URL = TEST_DB;
+  db = await import("../db.js");
   admin = new pg.Pool({ connectionString: TEST_DB });
   await admin.query(
     `DROP TABLE IF EXISTS processed_updates, chat_locks, credit_ledger,
@@ -2140,13 +2144,120 @@ test("a bot name already taken in this chat is refused", { skip }, async () => {
   );
 });
 
-test("the per-chat lease is acquired on webhook handling, not just defined", async () => {
-  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(
-    new RegExp(String.fromCharCode(13, 10), "g"),
-    String.fromCharCode(10)
+test("the per-chat lease is actually taken on a webhook POST", { skip }, async () => {
+  // Behavioural, not a source check. The previous version only asserted that
+  // acquireChatLock appeared somewhere in the file, which passed even when the
+  // webhook never used it - because the helper existed and was simply unused.
+  //
+  // It measures the WORK, not the HTTP response: the webhook answers 200 before
+  // doing anything (Telegram would otherwise time out), so the round trip
+  // proves nothing.
+  const chatId = 4201;
+  await admin.query("DELETE FROM chat_locks WHERE chat_id = $1", [chatId]);
+  await admin.query(
+    "INSERT INTO chats (chat_id, title) VALUES ($1, 'Lease') ON CONFLICT (chat_id) DO NOTHING",
+    [chatId]
   );
-  assert.match(src, /acquireChatLock\(/, "the lease must be acquired");
-  assert.match(src, /releaseChatLock\(/, "and released");
+  await admin.query(
+    "INSERT INTO users (user_id, name) VALUES ($1, 'Waiter') ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name",
+    [9401]
+  );
+
+  assert.equal(await db.acquireChatLock(chatId, "someone-else", 3), true);
+
+  const before = await admin.query(
+    "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+    [chatId]
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 1100, chatId, fromId: 9401, fromName: "Waiter", text: "waiting on a lease" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  // Long enough that the message would have been stored if the lease were
+  // ignored.
+  await wait(1500);
+  const during = await admin.query(
+    "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+    [chatId]
+  );
+  assert.equal(
+    Number(during.rows[0].n),
+    Number(before.rows[0].n),
+    "the message must not be processed while another holder has the lease"
+  );
+
+  // Release, and the queued work must then run.
+  await db.releaseChatLock(chatId, "someone-else");
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM messages WHERE chat_id = $1",
+        [chatId]
+      );
+      return Number(rows[0].n) > Number(before.rows[0].n);
+    },
+    { label: "the queued message processed after release", timeout: 25000 }
+  );
+});
+
+test("the bot quota is enforced: free gets one bot, pro gets more", { skip }, async () => {
+  // The bot quota was a number in quota.js that nothing checked, until /addbot
+  // enforced it. This distinguishes the two plans, so the check cannot pass by
+  // refusing everyone.
+  const base = 4300;
+  const counts = {};
+
+  for (const [plan, expectTwo] of [["free", false], ["pro", true]]) {
+    const chatId = base + (plan === "free" ? 1 : 2);
+    const userId = 9500 + (plan === "free" ? 1 : 2);
+    telegram = [];
+
+    await admin.query(
+      "INSERT INTO users (user_id, name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name",
+      [userId, plan]
+    );
+    await admin.query(
+      "INSERT INTO chats (chat_id, title) VALUES ($1, $2) ON CONFLICT (chat_id) DO NOTHING",
+      [chatId, plan]
+    );
+    if (plan === "pro") {
+      await admin.query(
+        "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active') ON CONFLICT (user_id) DO UPDATE SET plan = 'pro', status = 'active'",
+        [userId]
+      );
+    }
+
+    await post(
+      "/telegram-webhook",
+      update({ updateId: 1200 + chatId, chatId, fromId: userId, fromName: plan, text: "/addbot One" }),
+      { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+    );
+    await waitFor(() => sentTo(chatId).length > 0, { label: plan + ": first bot" });
+
+    telegram = [];
+    await post(
+      "/telegram-webhook",
+      update({ updateId: 1300 + chatId, chatId, fromId: userId, fromName: plan, text: "/addbot Two" }),
+      { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+    );
+    await waitFor(() => sentTo(chatId).length > 0, { label: plan + ": second attempt" });
+
+    const { rows } = await admin.query(
+      "SELECT count(*)::int AS n FROM bots WHERE owner_user_id = $1",
+      [userId]
+    );
+    counts[plan] = Number(rows[0].n);
+    assert.equal(
+      Number(rows[0].n),
+      expectTwo ? 2 : 1,
+      "a " + plan + " plan must end with " + (expectTwo ? 2 : 1) + " bot(s), got " + rows[0].n
+    );
+  }
+
+  assert.ok(counts.free < counts.pro, "the two plans must actually differ");
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
