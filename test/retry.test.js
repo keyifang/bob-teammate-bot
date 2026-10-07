@@ -122,3 +122,36 @@ test("retry budget and the overload reply are configurable", async () => {
   assert.match(source, /OVERLOAD_BASE_DELAY_MS/);
   assert.match(source, /OVERLOAD_MAX_DELAY_MS/);
 });
+
+// Measured against the live free tier, not assumed. A 3-bot relay turn took
+// 19.9s with 4 overloads absorbed, and the overload frequently arrives as a
+// 200 carrying an error body rather than a 503 status. A probe that checks
+// res.ok and the status alone reports half of them as successful empty
+// replies - which is exactly what happened while measuring.
+test("the 200-with-error overload shape is recognised, as measured", async () => {
+  const source = await src();
+  const isOverload = extract(source, "isOverload");
+
+  // The exact body observed from the live provider.
+  const live = JSON.stringify({
+    error: {
+      message: "Upstream error from Nvidia: Service temporarily overloaded",
+      code: 503,
+      metadata: { error_type: "provider_overloaded" },
+    },
+  });
+  // Status is 200 - which is why status alone is not enough.
+  assert.equal(isOverload(200, live), true, "a 200 carrying this error must be retried");
+});
+
+test("the retry loop checks for overload in a 200 body, not only a bad status", async () => {
+  const source = await src();
+  // The loop must detect the no-choices shape, which is how a 200-with-error
+  // presents.
+  assert.match(
+    source,
+    /isOverload\(200, text\)/,
+    "the 200-with-error case must be classified as an overload"
+  );
+  assert.match(source, /returned no choices/, "and must be retried as one");
+});

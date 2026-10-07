@@ -416,10 +416,20 @@ without reliable model calls.
 
 ## 9. Honest unknowns
 
-- **Multi-bot relay latency.** A 5-bot debate at ~5–20s per bot is the largest
-  unverified risk in this plan. I have not measured it, and if it is slow the
-  relay design needs rethinking. **This is the first thing I would measure
-  after Phase 0.**
+- **Multi-bot relay latency — MEASURED.** A 3-bot relay turn against the live
+  free tier took **19.9s total** (8.4s / 4.5s / 7.0s per bot), with the retry
+  absorbing **4 overloads across the three calls**. All three answered.
+
+  The measurement also corrected an assumption: the free tier does not only
+  return a 503 status. It frequently returns **HTTP 200 carrying an error body**
+  (`{"error":{"code":503,"metadata":{"error_type":"provider_overloaded"}}}`).
+  A probe that checks `res.ok` and the status alone sees a "successful" empty
+  reply. The production retry handles both shapes, but a measurement that only
+  checks the status will under-report overloads by roughly half.
+
+  Design consequence: the 3-bot cap is load-bearing. At ~6.6s per bot, 5 bots
+  would be ~33s, which is a long time to leave a group waiting — and each extra
+  bot is another chance to hit the overload rate. The cap stays at 3.
 - **`openrouter/free` consistency.** Measured twice, correct once. Good enough
   for a free tier, not for a paid one.
 - **Supabase connection under Render.** Never tested — no project exists.
