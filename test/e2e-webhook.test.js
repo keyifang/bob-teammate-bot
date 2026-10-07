@@ -97,6 +97,18 @@ function startStub() {
             content = "Hey, Bob here. Happy to help out.";
           }
 
+          // A model tier ending ":notools" refuses any request carrying tools,
+          // which is how a provider without tool support behaves. Used to prove
+          // the reply still lands rather than failing outright.
+          if (parsed.model?.endsWith(":notools") && Array.isArray(parsed.tools)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                error: { message: "This model does not support tool calling.", code: 400 },
+              })
+            );
+          }
+
           const respond = () => {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
@@ -1725,6 +1737,144 @@ test("an unsigned payment event grants nothing", { skip }, async () => {
     [userId]
   );
   assert.equal(rows.length, 0, "an unsigned event must not create credit");
+});
+
+test("exporting to Word and Excel produces real, openable documents", { skip }, async () => {
+  // A zip that merely starts with "PK" is not proof it opens. The parts Word
+  // and Excel require are checked inside the archive, so a malformed document
+  // fails here rather than in the user's Word.
+  telegram = [];
+  const chatId = 3801;
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 950,
+      chatId,
+      fromId: 870,
+      fromName: "Human",
+      text: `@${BOT_USERNAME} give me a table`,
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an answer to export" });
+
+  const wanted = [["docx", ".docx"], ["xlsx", ".xlsx"]];
+  for (const [i, [format, ext]] of wanted.entries()) {
+    telegram = [];
+    await post(
+      "/telegram-webhook",
+      update({
+        updateId: 951 + i,
+        chatId,
+        fromId: 870,
+        fromName: "Human",
+        text: `/export ${format}`,
+      }),
+      { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+    );
+
+    await waitFor(() => telegram.some((t) => /sendDocument/.test(t.url)), {
+      label: `${format} document`,
+    });
+    const doc = telegram.find((t) => /sendDocument/.test(t.url));
+    assert.ok(
+      doc.raw.includes(`filename=`) && doc.raw.includes(ext),
+      `the upload must be a ${ext} file`
+    );
+
+    // The multipart body carries the file bytes; extract and inspect them.
+    // Separators built from char codes, so the bytes are exact and no
+    // escaping layer can mangle them.
+    const CRLF = String.fromCharCode(13, 10);
+    const CRLF2 = CRLF + CRLF;
+    const CRLF_DASH = CRLF + "--";
+    const marker = 'name="document"';
+    const at = doc.raw.indexOf(marker);
+    assert.ok(at >= 0, "the document part must be present");
+    const bodyStart = doc.raw.indexOf(CRLF2, at);
+    assert.ok(bodyStart > at, "the part must have a body");
+    const bodyEnd = doc.raw.indexOf(CRLF_DASH, bodyStart);
+    const bytes = Buffer.from(doc.raw.slice(bodyStart + 4, bodyEnd), "binary");
+    assert.equal(bytes.subarray(0, 2).toString(), "PK", `${format} must be a zip container`);
+
+    // The parts Word/Excel require must be inside the archive, by name.
+    const text = bytes.toString("latin1");
+    assert.ok(
+      text.includes("[Content_Types].xml"),
+      `${format} needs [Content_Types].xml`
+    );
+    const required = format === "docx" ? "word/document.xml" : "xl/worksheets/sheet1.xml";
+    assert.ok(text.includes(required), `${format} needs ${required}`);
+  }
+});
+
+test("a provider that refuses tools still produces an answer, not a failure", { skip }, async () => {
+  // opencode go's tool support cannot be verified without a key, so a user may
+  // select a model that rejects tools. The reply must still arrive.
+  telegram = [];
+  const chatId = 3901;
+  await seedNamedBot(chatId, {
+    ownerUserId: 880,
+    displayName: "NoTools",
+    modelTier: "vendor:notools",
+    relayPosition: 0,
+  });
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 970,
+      chatId,
+      fromId: 881,
+      fromName: "Human",
+      text: "@NoTools what is the capital of Portugal?",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, {
+    label: "an answer despite no tool support",
+    timeout: 20000,
+  });
+  assert.ok(sentTo(chatId).length >= 1, "the user must still get a reply");
+  // And it must be a real answer, not the generic fallback.
+  const texts = sentTexts(chatId);
+  assert.ok(
+    !/hit an error/i.test(texts.join(" ")),
+    `the reply must not be the error fallback: ${texts.join(" | ")}`
+  );
+});
+
+test("PDF degrades to HTML where Python is unavailable, instead of failing", { skip }, async () => {
+  // Vercel's Node runtime ships no Python, so ReportLab cannot run there. The
+  // user must still get a document.
+  //
+  // PYTHON_BIN is read at module load, so the condition is reproduced in a
+  // CHILD process with the env set before the import - setting it afterwards
+  // would silently have no effect and the test would prove nothing.
+  const { execFileSync } = await import("node:child_process");
+  const script = `
+    process.env.PYTHON_BIN = "definitely-not-a-python-binary";
+    const { renderPdfBuffer } = await import("./pdf.js");
+    try {
+      await renderPdfBuffer({ title: "t", body: "b" });
+      console.log("RESOLVED");
+    } catch (err) {
+      console.log(err.pythonUnavailable === true ? "FLAGGED" : "UNFLAGGED");
+    }
+  `;
+  const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+  assert.match(out, /FLAGGED/, `a missing Python must be flagged: ${out}`);
+
+  // The fallback format must be one that renders in-process, or the fallback
+  // would fail for the same reason the PDF did.
+  const { getFormat } = await import("../export.js");
+  const html = getFormat("html");
+  assert.ok(html && !html.needsProcess, "the fallback must not need a subprocess");
 });
 
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {

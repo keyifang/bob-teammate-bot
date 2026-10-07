@@ -40,6 +40,16 @@ export async function renderPdfBuffer({ title, body, source, createdAt }) {
         return reject(new Error(`could not start ${PYTHON}: ${err.message}`));
       }
 
+      // A serverless Node runtime does not ship Python (Vercel's does not), so
+      // this is a real, expected condition rather than a crash. It is marked
+      // with a flag so the caller can offer a format that DOES work there
+      // instead of showing the user a bare failure.
+      const fail = (msg) => {
+        const err = new Error(msg);
+        err.pythonUnavailable = true;
+        reject(err);
+      };
+
       let err = "";
       let settled = false;
       const timer = setTimeout(() => {
@@ -54,7 +64,7 @@ export async function renderPdfBuffer({ title, body, source, createdAt }) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        reject(new Error(`could not run ${PYTHON}: ${e.message}`));
+        fail(`could not run ${PYTHON}: ${e.message}`);
       });
       child.on("close", (code) => {
         if (settled) return;

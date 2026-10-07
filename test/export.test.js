@@ -156,3 +156,47 @@ test("formats that need a subprocess are marked async, pure ones are not", () =>
   assert.equal(getFormat("csv").needsProcess, undefined);
   assert.equal(getFormat("pdf").needsProcess, true, "pdf shells out to Python");
 });
+
+// --- Extensible formats ------------------------------------------------------
+//
+// Word, Excel and zip are the documented next step. A zip of a small coding
+// project is the case that motivated storage at all, so it is implemented now
+// rather than promised.
+
+test("word, excel and zip are registered", () => {
+  const ids = listFormats().map((f) => f.id);
+  for (const want of ["docx", "xlsx", "zip"]) {
+    assert.ok(ids.includes(want), `missing format ${want} (have ${ids.join(", ")})`);
+  }
+});
+
+test("every registered format still declares a valid extension and mime type", () => {
+  for (const f of listFormats()) {
+    assert.match(f.extension, /^[a-z0-9]{1,5}$/i, `${f.id} extension`);
+    assert.match(f.mime, /^[a-z]+\/[a-z0-9.+-]+$/i, `${f.id} mime`);
+  }
+});
+
+test("a zip of a coding project produces a real archive", async () => {
+  const { buildProjectZip } = await import("../export.js");
+  const zip = await buildProjectZip([
+    { path: "README.md", contents: "# Hi" },
+    { path: "src/index.js", contents: "console.log(1)" },
+  ]);
+  // PK is the local file header signature.
+  assert.equal(zip.subarray(0, 2).toString(), "PK", "must be a real zip");
+  assert.ok(zip.length > 100, "must contain the files, not just an empty header");
+});
+
+test("a zip refuses a path that escapes the project", async () => {
+  const { buildProjectZip } = await import("../export.js");
+  await assert.rejects(
+    () => buildProjectZip([{ path: "../evil.sh", contents: "x" }]),
+    /invalid path|escapes/i
+  );
+});
+
+test("an empty project zip is refused rather than producing an empty archive", async () => {
+  const { buildProjectZip } = await import("../export.js");
+  await assert.rejects(() => buildProjectZip([]), /no files|empty/i);
+});

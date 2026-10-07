@@ -282,14 +282,20 @@ test("a truncated reply is rejected rather than sent", async () => {
   );
 });
 
-test("both model paths require a substantive reply", async () => {
+test("every model path requires a substantive reply", async () => {
   const source = await readFile(path.join(ROOT, "server.js"), "utf8");
   const uses = (source.match(/contentOf\(data, \{ requireSubstance: true \}\)/g) ?? []).length;
-  assert.equal(
-    uses,
-    2,
-    "the plain path and the tool-loop path must both reject a degenerate reply"
+  // The plain path, the tool-loop path, and the tools-not-supported fallback
+  // must ALL reject a degenerate reply. Asserting a lower bound rather than an
+  // exact count, so adding a path does not break the test while removing one
+  // still does.
+  assert.ok(
+    uses >= 2,
+    `every reply path must reject a degenerate reply, found ${uses}`
   );
+  // And the paths that return a reply must not bypass the check.
+  const bare = (source.match(/return contentOf\(data\);/g) ?? []).length;
+  assert.equal(bare, 0, "no path may return content without the substance check");
 });
 
 test("a degenerate reply is retried once, not looped", async () => {

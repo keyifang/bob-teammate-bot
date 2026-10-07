@@ -10,6 +10,26 @@
 
 import { renderDocumentHtml, safeFileName } from "./document.js";
 
+// The archive-path rule lives here rather than importing storage.js: export
+// must not depend on storage being configured, and a zip of a project is a
+// valid export whether or not R2 is in use. The rule is deliberately the same
+// shape as storage's - an escaping path is refused, not silently rewritten.
+export function safeArchivePath(input) {
+  const raw = String(input ?? "").trim().replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/")) return null;
+  const out = [];
+  for (const part of raw.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return null; // escapes the project root
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return out.length ? out.join("/") : null;
+}
+
 // Pulls pipe-delimited tables out of model output. Telegram renders these as
 // monospaced blocks; CSV and PDF need them as structure.
 export function parseTables(body) {
@@ -85,6 +105,223 @@ function renderPdf() {
   throw new Error("renderPdf is not called directly - see pdf_export.py");
 }
 
+// --- Word, Excel and zip -----------------------------------------------------
+//
+// A real .docx and .xlsx are ZIP archives of XML parts. Building them here with
+// node:zlib keeps the dependency list empty, which matters because the point of
+// the format registry is that adding a format stays cheap.
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let crc = -1;
+  for (let i = 0; i < buf.length; i++) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xff];
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+// A minimal ZIP writer: local headers, a central directory, and the end record.
+// Entries are STORED rather than deflated - valid, universally readable, and
+// for small documents the saving would not justify another failure mode.
+function buildZip(entries) {
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+
+  for (const e of entries) {
+    const name = Buffer.from(e.path, "utf8");
+    const data = Buffer.from(e.contents, "utf8");
+    const crc = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 8); // compression: stored
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    chunks.push(local, name, data);
+
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
+    cd.writeUInt32LE(crc, 16);
+    cd.writeUInt32LE(data.length, 20);
+    cd.writeUInt32LE(data.length, 24);
+    cd.writeUInt16LE(name.length, 28);
+    cd.writeUInt32LE(offset, 42);
+    central.push(cd, name);
+
+    offset += local.length + name.length + data.length;
+  }
+
+  const centralBuf = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralBuf.length, 12);
+  end.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...chunks, centralBuf, end]);
+}
+
+function xmlEscape(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * A real .docx: a ZIP of the OOXML parts Word expects. The body is escaped and
+ * split into paragraphs, so a reply containing markup renders as text rather
+ * than being interpreted.
+ */
+export function buildDocx({ title, body } = {}) {
+  const paragraphs = String(body ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<w:p><w:r><w:t xml:space="preserve">${xmlEscape(line)}</w:t></w:r></w:p>`)
+    .join("");
+
+  const heading = title
+    ? `<w:p><w:r><w:rPr><w:b/><w:sz w:val="32"/></w:rPr><w:t xml:space="preserve">${xmlEscape(title)}</w:t></w:r></w:p>`
+    : "";
+
+  return buildZip([
+    {
+      path: "[Content_Types].xml",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+        "</Types>",
+    },
+    {
+      path: "_rels/.rels",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+        "</Relationships>",
+    },
+    {
+      path: "word/document.xml",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+        `<w:body>${heading}${paragraphs}</w:body></w:document>`,
+    },
+  ]);
+}
+
+/**
+ * A real .xlsx: one sheet, holding a table's rows when the reply has one and
+ * the prose otherwise. Inline strings avoid needing a shared-string table.
+ */
+export function buildXlsx(body) {
+  const tables = parseTables(body);
+  const rows = tables.length
+    ? [tables[0].headers, ...tables[0].rows]
+    : String(body ?? "")
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => [l.trim()]);
+
+  const sheetRows = rows
+    .map((row, r) => {
+      const cells = row
+        .map((cell, c) => {
+          const ref = `${String.fromCharCode(65 + c)}${r + 1}`;
+          return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(cell)}</t></is></c>`;
+        })
+        .join("");
+      return `<row r="${r + 1}">${cells}</row>`;
+    })
+    .join("");
+
+  return buildZip([
+    {
+      path: "[Content_Types].xml",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+        "</Types>",
+    },
+    {
+      path: "_rels/.rels",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+        "</Relationships>",
+    },
+    {
+      path: "xl/workbook.xml",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+    },
+    {
+      path: "xl/_rels/workbook.xml.rels",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+        "</Relationships>",
+    },
+    {
+      path: "xl/worksheets/sheet1.xml",
+      contents:
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+        `<sheetData>${sheetRows}</sheetData></worksheet>`,
+    },
+  ]);
+}
+
+/**
+ * A zip of a coding project. Every path is checked, because a path that came
+ * from a chat message is attacker-influenced and a traversal would escape the
+ * archive.
+ */
+export async function buildProjectZip(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error("no files to archive");
+  }
+  const entries = [];
+  for (const f of files) {
+    const safe = safeArchivePath(f?.path);
+    if (!safe) {
+      throw new Error(`invalid path: ${JSON.stringify(f?.path)} - it escapes the project`);
+    }
+    entries.push({ path: safe, contents: String(f?.contents ?? "") });
+  }
+  return buildZip(entries);
+}
+
 export const EXPORT_FORMATS = [
   {
     id: "pdf",
@@ -121,6 +358,35 @@ export const EXPORT_FORMATS = [
     extension: "csv",
     mime: "text/csv",
     render: renderCsv,
+  },
+  {
+    id: "docx",
+    label: "Word",
+    extension: "docx",
+    mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    // Binary: render returns a Buffer, so the caller must not wrap it in
+    // Buffer.from(..., "utf8").
+    binary: true,
+    render: buildDocx,
+  },
+  {
+    id: "xlsx",
+    label: "Excel",
+    extension: "xlsx",
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    binary: true,
+    render: (body) => buildXlsx(body),
+  },
+  {
+    id: "zip",
+    label: "Project zip",
+    extension: "zip",
+    mime: "application/zip",
+    binary: true,
+    needsProcess: true,
+    render: () => {
+      throw new Error("zip export needs a project - see buildProjectZip");
+    },
   },
 ];
 

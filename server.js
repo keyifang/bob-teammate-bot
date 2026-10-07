@@ -353,7 +353,12 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
         }
         throw new OverloadedError();
       }
-      throw new Error(`Model error: ${res.status} ${bodyText.slice(0, 300)}`);
+      // The status and body are attached so the caller can distinguish a
+      // provider that refuses TOOLS from a genuinely broken request.
+      const err = new Error(`Model error: ${res.status} ${bodyText.slice(0, 300)}`);
+      err.status = res.status;
+      err.bodyText = bodyText;
+      throw err;
     }
 
     const data = await res.json();
@@ -474,6 +479,16 @@ function contentOf(data, { requireSubstance = false } = {}) {
   return text;
 }
 
+// A provider that does not support tools answers with a 4xx naming tools, and
+// that is indistinguishable from a broken request unless it is recognised. It
+// matters because opencode go's tool support is NOT verifiable without a key,
+// so a user selecting one of its models must get a clear message rather than a
+// generic failure.
+export function looksLikeToolRejection(status, bodyText) {
+  if (status !== 400 && status !== 404 && status !== 422) return false;
+  return /tool|function.?call/i.test(bodyText ?? "");
+}
+
 // One retry for a degenerate reply. Kept separate from the tool loop so a
 // truncation mid-chain is retried with the same message history.
 async function callModel(chatId, systemPrompt, userPrompt, maxTokens = REPLY_MAX_TOKENS, label = "call", attempt = 0, model = MODEL_NAME, route = {}) {
@@ -520,16 +535,35 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
   const hopBudget = allowedHops(plan);
   let searchesUsed = 0;
 
-  let data = await modelRequest(chatId, "reply", {
-    model,
-    messages,
-    tools: TOOL_SCHEMAS,
-    tool_choice: "auto",
-    temperature: 0.7,
-    max_tokens: REPLY_MAX_TOKENS,
-  }, route, meter);
+  // Whether this model accepts tools. opencode go's support cannot be verified
+  // without a key, so the first refusal is detected and remembered for the
+  // turn - the user still gets an answer, from what the model knows.
+  let toolsAllowed = true;
+  let data;
+  try {
+    data = await modelRequest(chatId, "reply", {
+      model,
+      messages,
+      tools: TOOL_SCHEMAS,
+      tool_choice: "auto",
+      temperature: 0.7,
+      max_tokens: REPLY_MAX_TOKENS,
+    }, route, meter);
+  } catch (err) {
+    if (!looksLikeToolRejection(err?.status, err?.bodyText)) throw err;
+    // Retried without tools rather than failing the reply outright.
+    log(chatId, `${model} rejected tools; answering without them`);
+    toolsAllowed = false;
+    data = await modelRequest(chatId, "reply", {
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: REPLY_MAX_TOKENS,
+    }, route, meter);
+  }
   let choice = data.choices[0];
   let hops = 0;
+  if (!toolsAllowed) return contentOf(data, { requireSubstance: true });
 
   // The hop budget is a hard stop. When it runs out with the model still
   // asking for another tool, the remaining calls are forced to "none" so it
@@ -998,12 +1032,39 @@ async function sendExportDocument(chatId, title, body, formatId) {
   const source = await getChatTitle(chatId);
 
   let bytes;
-  if (format.needsProcess) {
+  if (format.id === "pdf") {
+    // PDF is the one format that shells out: ReportLab is pure Python, so it
+    // works on Render and Vercel where WeasyPrint's GTK chain does not.
     try {
       bytes = await renderPdfBuffer({ title, body, source });
     } catch (err) {
       console.error(`PDF export failed: ${err.message}`);
+      if (err?.pythonUnavailable) {
+        // A serverless Node runtime ships no Python, so PDF cannot work there.
+        // Falling back to HTML - which renders in-process - means the user gets
+        // a document rather than a refusal.
+        log(chatId, "PDF unavailable here (no Python); falling back to HTML");
+        return sendExportDocument(chatId, title, body, "html");
+      }
       await sendFormatted(chatId, "Couldn't build the PDF - try text or HTML?");
+      return;
+    }
+  } else if (format.id === "zip") {
+    // A project zip needs files, which a chat reply does not carry. Refusing
+    // with a reason beats sending an empty archive.
+    await sendFormatted(
+      chatId,
+      "A project zip needs files to archive. Send them and I'll package them."
+    );
+    return;
+  } else if (format.binary) {
+    // docx/xlsx render to a Buffer already; wrapping them in a utf8 Buffer
+    // would corrupt every byte above 0x7f.
+    try {
+      bytes = format.render({ title, body, source });
+    } catch (err) {
+      console.error(`${format.id} export failed: ${err.message}`);
+      await sendFormatted(chatId, `Couldn't build the ${format.label} - try PDF or text?`);
       return;
     }
   } else {
