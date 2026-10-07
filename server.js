@@ -253,10 +253,14 @@ function logUsage(chatId, label, data, meter) {
   );
 }
 
-function modelHeaders(apiKey = MODEL_API_KEY) {
+// Headers for one provider request. The provider decides what else is required:
+// opencode go returns 400 MissingSessionID without its session header, which is
+// declared on the provider rather than hardcoded here so the requirement cannot
+// be lost by a refactor of this function.
+function modelHeaders(route = {}) {
   const headers = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
+    Authorization: `Bearer ${route.apiKey || MODEL_API_KEY}`,
   };
   // OpenRouter uses these to attribute traffic; they are harmless and
   // ignored by any other provider.
@@ -264,6 +268,13 @@ function modelHeaders(apiKey = MODEL_API_KEY) {
   headers["X-Title"] = "KeYiCode CLI";
   headers["X-OpenRouter-Categories"] =
     "cli-agent,cloud-agent,programming-app,native-app-builder,personal-agent";
+
+  const provider = getProvider(route.provider);
+  if (provider?.requiresSessionHeader && route.sessionId) {
+    // Reuses the cache-stickiness id, so one conversation also maps to one
+    // provider session rather than two ids that drift apart.
+    headers[provider.requiresSessionHeader] = route.sessionId;
+  }
   return headers;
 }
 
@@ -341,7 +352,7 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
     try {
       res = await fetch(apiUrl, {
         method: "POST",
-        headers: modelHeaders(apiKey),
+        headers: modelHeaders(route),
         // session_id is a top-level body field, not a message. It is only sent
         // when the caller knows the conversation, so a one-off call is not
         // pinned to a provider it has no cache on.
@@ -415,9 +426,13 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
     // so the reply is only ever the answer. Sending it would post the model's
     // internal monologue - and the system prompt - into a group chat.
     const message = data?.choices?.[0]?.message;
+    // opencode go reports the scratchpad as reasoning_content; OpenRouter as
+    // reasoning. Reading only one leaves the other's in `content`, which is what
+    // posts an internal monologue into a group chat.
     if (message && typeof message.content === "string" && looksLikeReasoningLeak(message.content)) {
       console.error(`${label}: provider put the scratchpad in content; moving it to reasoning`);
-      message.reasoning = [message.reasoning, message.content].filter(Boolean).join("\n");
+      const scratchpad = message.reasoning_content ?? message.reasoning;
+      message.reasoning = [scratchpad, message.content].filter(Boolean).join("\n");
       message.content = null;
     }
     return data;

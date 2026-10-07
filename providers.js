@@ -63,6 +63,15 @@ export const PROVIDERS = {
     // Format is not published, so only the clearly-invalid is refused.
     keyPattern: null,
     keyHint: "any non-empty API key",
+    // Verified live: without this header every request returns
+    // 400 {"type":"MissingSessionID"}, so a user selecting one of these models
+    // would get nothing at all. Declared here rather than in the call site so
+    // the requirement survives a refactor of the header builder.
+    requiresSessionHeader: "x-opencode-session",
+    // Verified live: this provider reports reasoning under a different name
+    // than OpenRouter. Reading only one of them means the other's scratchpad
+    // lands in the chat.
+    reasoningField: "reasoning_content",
   },
 };
 
