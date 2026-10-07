@@ -32,7 +32,10 @@ const res = await fetch(
     body: JSON.stringify({
       url: WEBHOOK_URL,
       secret_token: WEBHOOK_SECRET,
-      allowed_updates: ["message"],
+      // callback_query MUST be listed or Telegram never delivers a button
+      // press: every /bot_model provider, model, credit and format button would
+      // simply do nothing.
+      allowed_updates: ["message", "callback_query"],
     }),
   }
 );

@@ -138,3 +138,12 @@ test("no deployment file embeds a real secret", async () => {
     );
   }
 });
+
+test("the webhook registration asks for callback_query, or every button is dead", async () => {
+  // Verified live: setWebhook with allowed_updates:["message"] succeeds and
+  // looks fine, but Telegram never delivers a button press - so /bot_model's
+  // provider, model, credit and format buttons would silently do nothing.
+  const src = await read("register-webhook.js");
+  assert.match(src, /allowed_updates/, "the field must be set explicitly");
+  assert.match(src, /callback_query/, "callback_query must be requested");
+});
