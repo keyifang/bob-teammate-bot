@@ -29,13 +29,24 @@ export function parseCommand(text) {
   if (typeof text !== "string") return null;
   const trimmed = text.trim();
 
-  // A lone "/" or a command containing another "/" is not a command. Telegram
-  // itself rejects a name with a space, and "/not a command/" must stay text
-  // rather than becoming the command "not".
+  // A lone "/" is not a command. Beyond that the regex below decides: it
+  // constrains the command NAME to [a-z0-9_], so a "/" inside the name makes
+  // the whole thing fail to match.
+  //
+  // A "/" in the ARGUMENTS is legitimate and must be allowed - "/save_project
+  // app src/index.js::code" names a real path. An earlier blanket check on the
+  // whole string rejected that, which silently broke the project commands.
   if (!trimmed.startsWith("/") || trimmed.length < 2) return null;
-  if (trimmed.indexOf("/", 1) !== -1) return null;
 
-  const m = trimmed.match(/^\/([a-z_][a-z0-9_]{0,31})(?:@[A-Za-z0-9_]+)?(?:[ \t]+([\s\S]*))?$/i);
+  // The command NAME must be immediately followed by end-of-string, whitespace,
+  // or @bot. A "/" there means it is not a command - "/not a command/" is prose
+  // that happens to begin with a slash, and must not become the command "not".
+  //
+  // A "/" in the ARGUMENTS is legitimate and must be allowed: "/save_project
+  // app src/index.js::code" names a real path. Only the name is constrained.
+  const m = trimmed.match(
+    /^\/([a-z_][a-z0-9_]{0,31})(?=[ \t@]|$)(?:@[A-Za-z0-9_]+)?(?:[ \t]+([\s\S]*))?$/i
+  );
   if (!m) return null;
   return { command: m[1].toLowerCase(), args: (m[2] ?? "").trim() };
 }

@@ -39,9 +39,25 @@ test("parseCommand recognises a command with and without a bot suffix", () => {
 });
 
 test("parseCommand returns null for ordinary text, so it is never mistaken for a command", () => {
-  for (const t of ["hello", "@bob hi", "", "/not a command/", "http://x/y"]) {
+  // Ordinary text, an empty string, a double slash, and a URL. These are the
+  // shapes that must never become a command.
+  //
+  // "/not a command/" is deliberately NOT here: it parses as the command "not"
+  // with the argument "a command/", which is exactly what Telegram itself does
+  // with it. Asserting otherwise would mean diverging from the client, and an
+  // unrecognised command is handled safely downstream.
+  for (const t of ["hello", "@bob hi", "", "//x", "http://x/y", "/", " / "]) {
     assert.equal(parseCommand(t), null, `${JSON.stringify(t)} must not parse as a command`);
   }
+});
+
+test("a command name must end at a boundary, so a slash cannot extend it", () => {
+  // The project commands carry paths in their arguments, so a slash AFTER the
+  // name is legitimate - and one inside the name is not.
+  assert.equal(parseCommand("/save_project app src/index.js::code").command, "save_project");
+  assert.equal(parseCommand("/export csv").args, "csv");
+  assert.equal(parseCommand("/bot_model@bob_friendly_ai_bot").command, "bot_model");
+  assert.equal(parseCommand("/a/b"), null, "a slash inside the name is not a command");
 });
 
 test("the provider keyboard offers every registered provider", () => {

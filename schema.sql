@@ -189,3 +189,17 @@ CREATE TABLE IF NOT EXISTS processed_payments (
   event_id TEXT PRIMARY KEY,
   processed_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- What is in a user's stored project. The FILES live in R2; this is the
+-- manifest, so /project_zip can rebuild the archive without listing the bucket.
+CREATE TABLE IF NOT EXISTS project_files (
+  user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  project_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  size INT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (user_id, project_name, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_files_user
+  ON project_files (user_id, project_name);

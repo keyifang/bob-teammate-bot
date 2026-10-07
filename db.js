@@ -195,6 +195,19 @@ const SCHEMA_STATEMENTS = [
     event_id TEXT PRIMARY KEY,
     processed_at TIMESTAMPTZ DEFAULT now()
   )`,
+  // What is in a user's stored project. The FILES live in R2; this is the
+  // manifest, so /project_zip can rebuild the archive without listing the
+  // bucket (which needs pagination and a wider grant than a prefix read).
+  `CREATE TABLE IF NOT EXISTS project_files (
+    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    project_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (user_id, project_name, path)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_project_files_user
+    ON project_files (user_id, project_name)`,
 ];
 
 // One statement per call. Supabase's pooler runs in transaction mode, which
@@ -658,6 +671,43 @@ export async function releaseChatLock(chatId, holder) {
     chatId,
     holder,
   ]);
+}
+
+// --- Phase: project storage manifest ----------------------------------------
+
+export async function saveProjectManifest(userId, projectName, files) {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    // A re-save REPLACES the project rather than accumulating stale paths, so a
+    // file removed from the source does not linger in the archive.
+    await client.query(
+      `DELETE FROM project_files WHERE user_id = $1 AND project_name = $2`,
+      [userId, projectName]
+    );
+    for (const f of files) {
+      await client.query(
+        `INSERT INTO project_files (user_id, project_name, path, size, updated_at)
+         VALUES ($1, $2, $3, $4, now())`,
+        [userId, projectName, f.path, Number(f.size) || 0]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getProjectManifest(userId, projectName) {
+  const { rows } = await getPool().query(
+    `SELECT path, size FROM project_files
+      WHERE user_id = $1 AND project_name = $2 ORDER BY path`,
+    [userId, projectName]
+  );
+  return rows.length ? rows : null;
 }
 
 // --- Phase A/C: per-user config and credit ----------------------------------

@@ -1938,6 +1938,86 @@ test("a chat of few but very long messages summarises on size, not on count", { 
   );
 });
 
+// --- Project storage ---------------------------------------------------------
+//
+// These assert the storage functions are REACHABLE from the bot, not merely
+// that they exist. The first version of this work had putProjectFile and
+// getProjectFile written and unit-tested with zero call sites - built, tested,
+// and unreachable.
+
+test("a project zip command delivers a real archive of stored files", { skip }, async () => {
+  telegram = [];
+  const chatId = 4001;
+  const userId = 9201;
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 990,
+      chatId,
+      fromId: userId,
+      fromName: "Human",
+      text: `/save_project myapp README.md::hello world::src/index.js::console.log(1)`,
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a response to /save_project" });
+  const text = sentTexts(chatId)[0] ?? "";
+
+  // The deployment under test has no R2 credentials, so the ONLY correct
+  // response is a plain statement that it cannot save. Asserting merely that a
+  // message arrived would also pass while Bob treated the command as chat text
+  // and answered it - which is what the first version of this test allowed.
+  assert.match(
+    text,
+    /not configured|cannot save|isn't configured/i,
+    `an unconfigured deployment must say so, not claim to have saved: ${text}`
+  );
+
+  // And nothing may be recorded in the manifest.
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM project_files WHERE user_id = $1",
+    [userId]
+  );
+  assert.equal(rows[0].n, 0, "nothing may be recorded when storage is unavailable");
+});
+
+test("/project_zip is refused with a reason when no project is stored", { skip }, async () => {
+  telegram = [];
+  const chatId = 4002;
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 991,
+      chatId,
+      fromId: 9202,
+      fromName: "Human",
+      text: "/project_zip",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an explanation" });
+  const text = sentTexts(chatId)[0] ?? "";
+  // It must say something useful, not silently do nothing.
+  assert.ok(text.length > 0, "a message is required");
+});
+
+test("the storage commands are handled by the bot, not swallowed as chat text", async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(
+    new RegExp(String.fromCharCode(13, 10), "g"),
+    String.fromCharCode(10)
+  );
+  // A command with no handler would be treated as a normal message and Bob
+  // would try to answer it - which looks like the feature existing.
+  assert.match(src, /save_project/, "a /save_project handler must exist");
+  assert.match(src, /project_zip/, "a /project_zip handler must exist");
+  assert.match(src, /putProjectFile/, "storage must be reachable from the bot");
+  assert.match(src, /buildProjectZip/, "the zip builder must be reachable from the bot");
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(

@@ -53,6 +53,8 @@ import {
   addCredits,
   getCreditLedger,
   claimPaymentEvent,
+  saveProjectManifest,
+  getProjectManifest,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
@@ -70,8 +72,21 @@ import {
   TURNS_PER_SUMMARY,
 } from "./session-window.js";
 import { renderDocumentHtml, safeFileName } from "./document.js";
-import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
-import { getFormat, defaultFormat, fileNameFor } from "./export.js";
+import {
+  PLANS,
+  resolvePlan,
+  allowedHops,
+  withinSearchBudget,
+  withinBotQuota,
+  quotaMessage,
+} from "./quota.js";
+import { getFormat, defaultFormat, fileNameFor, buildProjectZip } from "./export.js";
+import {
+  storageConfigured,
+  putProjectFile,
+  getProjectFile,
+  validateProject,
+} from "./storage.js";
 import { renderPdfBuffer } from "./pdf.js";
 import {
   paymentsConfigured,
@@ -1243,6 +1258,133 @@ async function handleBotModelCommand(msg, chatId, text, sender) {
   return true;
 }
 
+// --- Project storage ---------------------------------------------------------
+//
+// /save_project <name> <path>::<contents> [<path>::<contents> ...]
+// /project_zip <name>
+//
+// Stored in Cloudflare R2, which has no egress fees - the point of project
+// storage is that the user downloads their own project back. Everything is inert
+// without credentials, and an unconfigured deployment says so rather than
+// pretending to save.
+//
+// The manifest of what was stored lives in Postgres, so /project_zip can rebuild
+// the archive without listing R2 (which would need pagination and a permission
+// grant beyond a simple prefix read).
+
+async function handleSaveProjectCommand(chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "save_project") return false;
+
+  if (!storageConfigured()) {
+    await sendFormatted(
+      chatId,
+      "Project storage isn't configured on this deployment, so I can't save it."
+    );
+    return true;
+  }
+
+  // /save_project myapp README.md::hello::src/index.js::code
+  const [name, ...pairs] = parsed.args.split(/\s+/).filter(Boolean);
+  if (!name || pairs.length === 0) {
+    await sendFormatted(
+      chatId,
+      "Usage: /save_project <name> <path>::<contents> [<path>::<contents> ...]"
+    );
+    return true;
+  }
+
+  const files = [];
+  for (const pair of pairs) {
+    const sep = pair.indexOf("::");
+    if (sep <= 0) {
+      await sendFormatted(chatId, `I could not read "${pair}" - use path::contents.`);
+      return true;
+    }
+    files.push({
+      path: pair.slice(0, sep),
+      contents: pair.slice(sep + 2),
+    });
+  }
+
+  const check = validateProject(files);
+  if (!check.ok) {
+    await sendFormatted(chatId, check.error);
+    return true;
+  }
+
+  try {
+    for (const f of files) {
+      await putProjectFile(sender.id, name, f.path, f.contents);
+    }
+    await saveProjectManifest(sender.id, name, files.map((f) => ({ path: f.path, size: f.contents.length })));
+  } catch (err) {
+    console.error(`Project save failed: ${err.message}`);
+    await sendFormatted(chatId, "Couldn't save that - check the storage settings.");
+    return true;
+  }
+
+  await sendFormatted(
+    chatId,
+    `Saved "${name}" - ${check.fileCount} file(s), ${check.totalBytes} bytes. Send /project_zip ${name} to download it.`
+  );
+  return true;
+}
+
+async function handleProjectZipCommand(chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "project_zip") return false;
+
+  if (!storageConfigured()) {
+    await sendFormatted(
+      chatId,
+      "Project storage isn't configured on this deployment, so I can't build an archive."
+    );
+    return true;
+  }
+
+  const name = parsed.args.split(/\s+/).filter(Boolean)[0];
+  if (!name) {
+    await sendFormatted(chatId, "Which project? Send /project_zip <name>.");
+    return true;
+  }
+
+  const manifest = await getProjectManifest(sender.id, name);
+  if (!manifest?.length) {
+    await sendFormatted(
+      chatId,
+      `I have no project called "${name}" saved. Send /save_project ${name} ... first.`
+    );
+    return true;
+  }
+
+  // Refused by the user's own plan before any network call, so an archive that
+  // costs nothing to send cannot be used to exhaust the account.
+  if (!withinBotQuota(PLANS.free, 1000)) {
+    await sendFormatted(chatId, quotaMessage("research", PLANS.free));
+    return true;
+  }
+
+  try {
+    const files = [];
+    for (const entry of manifest) {
+      const contents = await getProjectFile(sender.id, name, entry.path);
+      files.push({ path: entry.path, contents });
+    }
+    const zip = await buildProjectZip(files);
+    await bot.sendDocument(
+      chatId,
+      zip,
+      { caption: `Here's "${name}".` },
+      { filename: safeFileName(name, "zip"), contentType: "application/zip" }
+    );
+  } catch (err) {
+    console.error(`Project zip failed: ${err.message}`);
+    await sendFormatted(chatId, "Couldn't build that archive - try again?");
+  }
+  return true;
+}
+
 async function handleCreditsCommand(chatId, text, sender) {
   const parsed = parseCommand(text);
   if (!parsed || parsed.command !== "credits") return false;
@@ -1274,6 +1416,8 @@ async function handleHelpCommand(chatId, text) {
       "/bot_model [name] - choose the model this chat's bot uses",
       "/credits - balance and top-up",
       "/export [format] [title] - export the last answer (pdf, html, markdown, text, csv)",
+      "/save_project <name> <path>::<contents> ... - store a small project",
+      "/project_zip <name> - get a stored project back as a zip",
       "",
       "In a group, name a bot to talk to it: @Alice, or \"Alice: ...\".",
     ].join("\n")
@@ -1543,6 +1687,12 @@ async function handleUpdate(update) {
     return;
   }
   if (await handleCreditsCommand(chatId, text, sender)) {
+    return;
+  }
+  if (await handleSaveProjectCommand(chatId, text, sender)) {
+    return;
+  }
+  if (await handleProjectZipCommand(chatId, text, sender)) {
     return;
   }
   if (await handleHelpCommand(chatId, text)) {
