@@ -218,8 +218,3 @@ export async function getProjectFile(ownerUserId, projectName, filePath, env = p
   return Buffer.from(await res.arrayBuffer());
 }
 
-export async function deleteProjectFile(ownerUserId, projectName, filePath, env = process.env) {
-  const key = projectKey(ownerUserId, projectName, filePath);
-  await r2Request({ method: "DELETE", key, env });
-  return key;
-}

@@ -1,5 +1,6 @@
 import "./env.js"; // must precede every module that reads process.env on load
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 import path from "node:path";
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
@@ -55,11 +56,17 @@ import {
   claimPaymentEvent,
   saveProjectManifest,
   getProjectManifest,
+  createBot,
+  getBotByName,
+  linkBotToChat,
+  countBotsForOwner,
+  acquireChatLock,
+  releaseChatLock,
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
-import { routeMessage, stripAddress, isRelay } from "./bots.js";
+import { routeMessage, stripAddress, isRelay, normalizeBotName } from "./bots.js";
 import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
 import {
@@ -1385,6 +1392,65 @@ async function handleProjectZipCommand(chatId, text, sender) {
   return true;
 }
 
+// /addbot <name> - create a named persona and link it to this chat.
+//
+// This is how a user creates a bot at all. Without it the bots table could only
+// be populated by hand, which made the whole named-bot feature unreachable
+// from the product.
+async function handleAddBotCommand(chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "addbot") return false;
+
+  // The bot belongs to the person who made it, not to whoever is in the chat.
+  const name = parsed.args.trim();
+  const checked = normalizeBotName(name);
+  if (!checked.ok) {
+    await sendFormatted(chatId, checked.error);
+    return true;
+  }
+
+  const existing = await getBotByName(chatId, checked.name);
+  if (existing && Number(existing.owner_user_id) === Number(sender.id)) {
+    await sendFormatted(chatId, `You already have a bot called "${checked.name}" here.`);
+    return true;
+  }
+
+  // The plan's cap, enforced at the point of creation rather than assumed. A
+  // user on the free plan gets one bot; without this the quota is a number in
+  // quota.js that nothing checks.
+  const plan = await planForOwner(sender.id);
+  const owned = await countBotsForOwner(sender.id);
+  if (!withinBotQuota(plan, owned)) {
+    await sendFormatted(chatId, quotaMessage("bots", plan));
+    return true;
+  }
+
+  try {
+    await upsertUser(sender.id, sender.first_name ?? "Unknown");
+    const bot = await createBot({
+      ownerUserId: sender.id,
+      telegramUserId: null,
+      displayName: checked.name,
+    });
+    // New bots go to the end of the relay order, so adding one never changes
+    // who speaks first in an existing discussion.
+    const existingBots = await getBotsForChat(chatId);
+    await linkBotToChat(bot.bot_id, chatId, {
+      relayPosition: existingBots.length,
+    });
+  } catch (err) {
+    console.error("Bot creation failed:", err.message);
+    await sendFormatted(chatId, "Couldn't create that bot - try a different name?");
+    return true;
+  }
+
+  await sendFormatted(
+    chatId,
+    `Added ${checked.name}. Address it with @${checked.name.replace(/\s+/g, "")} or "${checked.name}: ..."`
+  );
+  return true;
+}
+
 async function handleCreditsCommand(chatId, text, sender) {
   const parsed = parseCommand(text);
   if (!parsed || parsed.command !== "credits") return false;
@@ -1415,6 +1481,7 @@ async function handleHelpCommand(chatId, text) {
       "Commands:",
       "/bot_model [name] - choose the model this chat's bot uses",
       "/credits - balance and top-up",
+      "/addbot <name> - add a named bot to this chat",
       "/export [format] [title] - export the last answer (pdf, html, markdown, text, csv)",
       "/save_project <name> <path>::<contents> ... - store a small project",
       "/project_zip <name> - get a stored project back as a zip",
@@ -1686,6 +1753,9 @@ async function handleUpdate(update) {
   if (await handleBotModelCommand(msg, chatId, text, sender)) {
     return;
   }
+  if (await handleAddBotCommand(chatId, text, sender)) {
+    return;
+  }
   if (await handleCreditsCommand(chatId, text, sender)) {
     return;
   }
@@ -1851,6 +1921,58 @@ function enqueueForChat(chatId, job) {
   return next;
 }
 
+// A Postgres lease around the in-process queue, so a per-chat serialisation
+// guarantee survives serverless, where two invocations share no memory and the
+// in-process Map serialises nothing.
+//
+// The lease BOUNDS the window rather than closing it: if two invocations arrive
+// in the same instant both can pass the check. The losing one retries briefly,
+// which is what turns a race into a short delay instead of two overlapping
+// replies.
+//
+// A failure to take the lease is NOT fatal. On a long-lived process the
+// in-process queue already serialises correctly, so degrading to it is safer
+// than refusing the message.
+async function withChatLease(chatId, job) {
+  const holder = `inv-${crypto.randomUUID()}`;
+  const LEASE_TTL_S = 300;
+  let held = false;
+
+  try {
+    held = await acquireChatLock(chatId, holder, LEASE_TTL_S);
+  } catch (err) {
+    console.error(`Chat lease unavailable for ${chatId}:`, err.message);
+    return enqueueForChat(chatId, job);
+  }
+
+  if (!held) {
+    // Someone else is mid-turn for this chat. Wait for the in-process queue to
+    // drain and retry a bounded number of times; if it never frees, do the work
+    // anyway rather than silently dropping the message.
+    for (let i = 0; i < 20; i++) {
+      await sleep(500);
+      if (await acquireChatLock(chatId, holder, LEASE_TTL_S)) {
+        held = true;
+        break;
+      }
+    }
+    if (!held) {
+      console.error(`Proceeding without a lease for chat ${chatId}`);
+      return enqueueForChat(chatId, job);
+    }
+  }
+
+  try {
+    return await enqueueForChat(chatId, job);
+  } finally {
+    if (held) {
+      await releaseChatLock(chatId, holder).catch((err) =>
+        console.error(`Chat lease release failed for ${chatId}:`, err.message)
+      );
+    }
+  }
+}
+
 app.post("/telegram-webhook", async (req, res) => {
   const secret = req.header("X-Telegram-Bot-Api-Secret-Token");
   if (secret !== WEBHOOK_SECRET) return res.sendStatus(403); // TC-34
@@ -1870,10 +1992,10 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 
   if (chatId === undefined) {
-    await enqueueForChat("global", () => handleUpdate(update));
+    await withChatLease("global", () => handleUpdate(update));
     return;
   }
-  await enqueueForChat(chatId, () => handleUpdate(update));
+  await withChatLease(chatId, () => handleUpdate(update));
 });
 
 // Stripe webhook. Credit is granted ONLY here, and only after the signature

@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "register": "node register-webhook.js",
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node scripts/audit-exports.mjs && node --test \"test/**/*.test.js\"",
+    "audit": "node scripts/audit-exports.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",

@@ -2018,6 +2018,137 @@ test("the storage commands are handled by the bot, not swallowed as chat text", 
   assert.match(src, /buildProjectZip/, "the zip builder must be reachable from the bot");
 });
 
+async function dbLinkBot(ownerUserId, chatId, displayName) {
+  const { rows } = await admin.query(
+    `INSERT INTO bots (owner_user_id, display_name) VALUES ($1, $2) RETURNING bot_id`,
+    [ownerUserId, displayName]
+  );
+  await admin.query(
+    `INSERT INTO bot_chats (bot_id, chat_id, relay_position) VALUES ($1, $2, 0)
+     ON CONFLICT (bot_id, chat_id) DO NOTHING`,
+    [rows[0].bot_id, chatId]
+  );
+  return Number(rows[0].bot_id);
+}
+
+// --- Phase A follow-up: bots must be creatable, and the lease must be used ----
+//
+// Both were built and tested but unreachable: there was no /addbot, so a user
+// could not create a bot at all; and the Postgres chat lease was never
+// acquired, so serverless had no per-chat serialisation.
+
+test("/addbot creates a bot and links it to this chat", { skip }, async () => {
+  telegram = [];
+  const chatId = 4101;
+  const userId = 9301;
+
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Botmaker')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [userId]
+  );
+  await admin.query(
+    "INSERT INTO chats (chat_id, title) VALUES ($1, 'Bot shop') ON CONFLICT (chat_id) DO NOTHING",
+    [chatId]
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 1000,
+      chatId,
+      fromId: userId,
+      fromName: "Botmaker",
+      text: "/addbot Scout",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a response to /addbot" });
+
+  const { rows } = await admin.query(
+    `SELECT b.bot_id, b.display_name, bc.chat_id
+       FROM bots b JOIN bot_chats bc ON bc.bot_id = b.bot_id
+      WHERE b.owner_user_id = $1 AND b.display_name = 'Scout'`,
+    [userId]
+  );
+  assert.equal(rows.length, 1, "/addbot must actually create the bot");
+  assert.equal(Number(rows[0].chat_id), chatId, "and link it to this chat");
+});
+
+test("an invalid bot name is refused with a reason", { skip }, async () => {
+  telegram = [];
+  const chatId = 4102;
+  const userId = 9302;
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 1001,
+      chatId,
+      fromId: userId,
+      fromName: "Botmaker",
+      text: "/addbot Bad,Name",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an explanation" });
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM bots WHERE owner_user_id = $1",
+    [userId]
+  );
+  assert.equal(rows[0].n, 0, "an invalid name must not create a bot");
+});
+
+test("a bot name already taken in this chat is refused", { skip }, async () => {
+  telegram = [];
+  const chatId = 4103;
+  const userId = 9303;
+  await admin.query(
+    `INSERT INTO users (user_id, name) VALUES ($1, 'Botmaker')
+     ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name`,
+    [userId]
+  );
+  await admin.query(
+    "INSERT INTO chats (chat_id, title) VALUES ($1, 'Dupes') ON CONFLICT (chat_id) DO NOTHING",
+    [chatId]
+  );
+  await dbLinkBot(userId, chatId, "Twin");
+
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 1002,
+      chatId,
+      fromId: userId,
+      fromName: "Botmaker",
+      text: "/addbot Twin",
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => sentTo(chatId).length > 0, { label: "an explanation" });
+  const { rows } = await admin.query(
+    "SELECT count(*)::int AS n FROM bots WHERE owner_user_id = $1 AND display_name = 'Twin'",
+    [userId]
+  );
+  assert.equal(rows[0].n, 1, "a duplicate name must not create a second bot");
+  // It must SAY so. Without this the test also passed while the command was
+  // ignored entirely and a row happened not to be created.
+  assert.match(
+    sentTexts(chatId).join(" "),
+    /already have a bot called/i,
+    "the refusal must be explained"
+  );
+});
+
+test("the per-chat lease is acquired on webhook handling, not just defined", async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(
+    new RegExp(String.fromCharCode(13, 10), "g"),
+    String.fromCharCode(10)
+  );
+  assert.match(src, /acquireChatLock\(/, "the lease must be acquired");
+  assert.match(src, /releaseChatLock\(/, "and released");
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(
