@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { HUMANIZER_SYSTEM_PROMPT } from "../config.js";
+
 // The humanizer is a whole extra model call per reply. On a free reasoning
 // model that measured ~31s and ~660 reasoning tokens to reword a short
 // sentence, which is a large share of the total time a user waits.
@@ -86,4 +88,20 @@ test("the defaults skip short replies and log slow calls", async () => {
   const m = source.match(/HUMANIZE_MAX_CHARS = Number\(process\.env\.HUMANIZE_MAX_CHARS \?\? (\d+)\)/);
   assert.ok(Number(m[1]) > 0, "the limit must be a positive number of characters");
   assert.match(source, /HUMANIZE_SKIP_UNDER = process\.env\.HUMANIZE_SKIP_UNDER \?\? "true"/);
+});
+
+// The humanizer is the last stop before a reply reaches a chat, so it is where
+// "do not write an essay" has to be enforced. The persona already caps length,
+// but a model that ignored the persona would otherwise be reworded into a
+// still-long reply.
+test("the humanizer prompt forbids an essay, not just a formal tone", () => {
+  assert.match(HUMANIZER_SYSTEM_PROMPT, /essay|writeup|not write/i);
+  assert.match(HUMANIZER_SYSTEM_PROMPT, /as short as/i);
+  // And it must not flatten a list or table, where length IS the content.
+  assert.match(HUMANIZER_SYSTEM_PROMPT, /list|table/i);
+});
+
+test("the humanizer prompt still preserves meaning and returns only the message", () => {
+  assert.match(HUMANIZER_SYSTEM_PROMPT, /[Pp]reserve the meaning/);
+  assert.match(HUMANIZER_SYSTEM_PROMPT, /ONLY the rewritten message/);
 });

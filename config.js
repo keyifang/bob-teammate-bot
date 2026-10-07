@@ -74,6 +74,12 @@ export function ensureAiDisclosure(text) {
 export const HUMANIZER_SYSTEM_PROMPT = `
 Rewrite the following message so it reads like a quick, casual message typed
 in a group chat, not a polished AI response. Preserve the meaning exactly.
+
+People in chats do not write essays or writeups. Keep it as short as the
+meaning allows: cut filler, cut restated context, cut any sentence that only
+sets up another sentence. If the message is a list or a table, keep that
+structure - those are the case where length is the content.
+
 Return ONLY the rewritten message.
 `;
 

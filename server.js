@@ -53,6 +53,7 @@ import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay } from "./bots.js";
 import { modelForBot } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
+import { selectWindow, orderForCache, DEFAULT_TURNS } from "./session-window.js";
 import { renderDocumentHtml, safeFileName } from "./document.js";
 import { PLANS, resolvePlan, allowedHops, withinSearchBudget, quotaMessage } from "./quota.js";
 import { getFormat, defaultFormat, fileNameFor } from "./export.js";
@@ -267,6 +268,15 @@ function overloadDelay(attempt) {
   return Math.floor(Math.random() * ceiling);
 }
 
+// OpenRouter's sticky routing uses session_id to pin a conversation to one
+// provider, which is what makes prefix reuse land on a warm cache. Without it,
+// sticky routing only activates after a cache hit is observed - so the first
+// few turns each pay full price. Keyed per bot per chat, so two bots in one
+// chat do not thrash the same cache entry.
+function sessionIdFor(botId, chatId) {
+  return `bob-${botId ?? "relay"}-${chatId}`;
+}
+
 async function modelRequest(chatId, label, payload, route = {}, meter = null) {
   const startedAt = Date.now();
   let lastOverload = null;
@@ -282,7 +292,12 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
       res = await fetch(apiUrl, {
         method: "POST",
         headers: modelHeaders(apiKey),
-        body: JSON.stringify(payload),
+        // session_id is a top-level body field, not a message. It is only sent
+        // when the caller knows the conversation, so a one-off call is not
+        // pinned to a provider it has no cache on.
+        body: JSON.stringify(
+          route.sessionId ? { ...payload, session_id: route.sessionId } : payload
+        ),
         // A free-tier model queues unpredictably and thinks at length, so the
         // wait is bounded generously rather than tightly. Aborting early means
         // the user gets the fallback message instead of an answer.
@@ -683,22 +698,30 @@ function buildTranscript(messages) {
 // across groups (requirement 9). Nothing from another bot's transcript can
 // reach this prompt, because every read is keyed by this bot's id.
 async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = "") {
+  // Read a little more than the window so selectWindow can take the last N in
+  // order; every read is keyed on THIS bot's id, so no other bot's or group's
+  // conversation can reach this prompt.
   const [summary, ownerMemory, recent] = await Promise.all([
     getBotSummary(bot.bot_id, chatId),
     getBotOwnerMemory(bot.bot_id),
-    getRecentBotMessages(bot.bot_id, chatId, KEEP_LAST),
+    getRecentBotMessages(bot.bot_id, chatId, DEFAULT_TURNS * 2),
   ]);
 
-  return buildReplyPrompt({
-    bobName: bot.display_name,
-    ownerName: bot.display_name,
-    crossChatSummary: ownerMemory,
-    summary,
-    transcript: buildTranscript(recent),
-    discussion,
-    // The latest message is the one being answered; it is not in the stored
-    // transcript yet, so it is appended explicitly.
-    latest: `${senderName}: ${text}`,
+  const window = selectWindow(recent, DEFAULT_TURNS);
+  const discussionBlock = discussion
+    ? `Others have already answered in this round:\n${discussion}\n` +
+      `Add your own view as ${bot.display_name} - agree, disagree, or add what ` +
+      "they missed. Do not repeat what they said."
+    : "";
+
+  // Stable-first: the persona is a constant, the summaries change rarely, and
+  // only the turns change per message - so the cacheable prefix stays put.
+  return orderForCache({
+    persona: PERSONA_SYSTEM_PROMPT,
+    ownerSummary: ownerMemory,
+    sessionSummary: summary,
+    turns: buildTranscript(window),
+    latest: [discussionBlock, `${senderName}: ${text}`].filter(Boolean).join("\n\n"),
   });
 }
 
@@ -810,14 +833,16 @@ async function planForOwner(ownerUserId) {
 // A user's own config wins; anything incomplete falls back to the deployment
 // default rather than breaking the bot, so a revoked key degrades to the
 // default instead of failing every reply.
-async function routeForUser(userId) {
+async function routeForUser(userId, sessionId = null) {
   const deploymentDefault = {
     provider: "openrouter",
     model: MODEL_NAME,
     apiKey: MODEL_API_KEY,
     apiUrl: MODEL_API_URL,
   };
-  if (userId == null) return { ...resolveUserModel(null, deploymentDefault), userId: null };
+  if (userId == null) {
+    return { ...resolveUserModel(null, deploymentDefault), userId: null, sessionId };
+  }
 
   let stored = null;
   try {
@@ -825,7 +850,7 @@ async function routeForUser(userId) {
   } catch (err) {
     console.error("Model config lookup failed, using the default:", err.message);
   }
-  return { ...resolveUserModel(stored, deploymentDefault), userId };
+  return { ...resolveUserModel(stored, deploymentDefault), userId, sessionId };
 }
 
 // Deducts the real cost of a turn from the payer's balance.
@@ -1307,7 +1332,7 @@ async function handleUpdate(update) {
       const prompt = await buildPersonaPrompt(personas[0], chatId, senderName, cleaned, "");
       await sendNamedBotReply(chatId, sender.id, personas[0], prompt, {
         plan: personaPlan,
-        route: await routeForUser(personas[0].owner_user_id),
+        route: await routeForUser(personas[0].owner_user_id, sessionIdFor(personas[0].bot_id, chatId)),
       });
       summarizeSafely(chatId);
       return;
@@ -1317,7 +1342,15 @@ async function handleUpdate(update) {
     // awaiting the turn here would hold the queue for its whole duration - and
     // the human's interjection would sit behind it, unable to cancel anything.
     // Starting it detached is what makes chiming in work at all.
-    runRelayTurn(chatId, sender.id, senderName, cleaned, personas, personaPlan, await routeForUser(personas[0].owner_user_id)).catch((err) =>
+    runRelayTurn(
+      chatId,
+      sender.id,
+      senderName,
+      cleaned,
+      personas,
+      personaPlan,
+      await routeForUser(personas[0].owner_user_id, sessionIdFor(personas[0].bot_id, chatId))
+    ).catch((err) =>
       console.error(`Relay turn failed for chat ${chatId}:`, err.message)
     );
     summarizeSafely(chatId);
@@ -1358,7 +1391,7 @@ async function handleUpdate(update) {
       firstContact: claimed,
     });
 
-    const senderRoute = await routeForUser(sender.id);
+    const senderRoute = await routeForUser(sender.id, sessionIdFor(null, chatId));
     try {
       await sendBobReply(
         chatId,
