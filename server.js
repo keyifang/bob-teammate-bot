@@ -216,6 +216,8 @@ app.use((req, res, next) =>
   req.path === "/stripe-webhook" ? next() : express.json({ limit: "1mb" })(req, res, next)
 );
 
+const processStartedAt = Date.now();
+
 function log(chatId, message) {
   console.log(`[chat ${chatId}] ${message}`);
 }
@@ -769,6 +771,7 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
               "'rate limited', 'unavailable', or a general lack of access unless that " +
               "is literally what went wrong - that reads as an excuse not to try.",
           ].join(" ");
+          noteFailure("tool", `${call.function.name}: ${err.message}`, err?.stack);
           log(chatId, `tool ${call.function.name} failed: ${err.message}`);
         }
       }
@@ -829,7 +832,14 @@ ${String(result).slice(0, 6000)}` });
     }
   }
 
-  return contentOf(data, { requireSubstance: true });
+  try {
+    return contentOf(data, { requireSubstance: true });
+  } catch (err) {
+    // Recorded with the REASON, because "hit an error" tells an operator
+    // nothing and this is where a rejected reply actually dies.
+    noteFailure("content-rejected", err?.message, err?.stack);
+    throw err;
+  }
 }
 
 // The humanizer is a full extra model call per reply. On a free reasoning model
@@ -907,6 +917,7 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
     // The reason is logged AND carried into the log line the operator reads.
     // A bare "hit an error" to the user with no record of why is the failure
     // mode that cost the most time to diagnose here.
+    noteFailure("reply", err?.message, err?.stack);
     console.error(
       "Reply generation failed:",
       err?.message,
@@ -1218,6 +1229,7 @@ async function summarizeSafely(chatId) {
   try {
     await summarizeIfNeeded(chatId);
   } catch (err) {
+    noteFailure("summarise", err?.message, err?.stack);
     console.error("Summarization failed:", err.message);
   }
 }
@@ -2250,6 +2262,38 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
   await addCredits(userId, credit, `purchase:${event.pack}`);
   log("stripe", `credited user ${userId} for pack ${event.pack}`);
   res.sendStatus(200);
+});
+
+// Recent failures, kept in memory so a deployed instance can be DIAGNOSED
+// without log access. Render's REST API exposes no runtime logs, so without
+// this the only way to learn why a reply failed is to guess - which is exactly
+// what went wrong here.
+//
+// Bounded ring buffer: the newest N, oldest dropped. Secrets never enter it -
+// callers pass a message and a stack, not a payload.
+const recentFailures = [];
+const MAX_FAILURES = 20;
+function noteFailure(kind, message, stack) {
+  recentFailures.push({
+    at: new Date().toISOString(),
+    kind,
+    message: String(message ?? "").slice(0, 400),
+    where: stack ? String(stack).split(String.fromCharCode(10)).slice(1, 4).join(" | ").slice(0, 400) : "",
+  });
+  while (recentFailures.length > MAX_FAILURES) recentFailures.shift();
+}
+
+// Guarded by the same secret Telegram uses, so it is not a public endpoint.
+app.get("/diagnostics", (req, res) => {
+  const secret = req.header("X-Telegram-Bot-Api-Secret-Token") ?? req.query.secret;
+  if (secret !== WEBHOOK_SECRET) return res.sendStatus(403);
+  res.json({
+    startedAt: processStartedAt,
+    uptimeSeconds: Math.round((Date.now() - processStartedAt) / 1000),
+    node: process.version,
+    model: MODEL_NAME,
+    failures: recentFailures.slice().reverse(),
+  });
 });
 
 app.get("/health", (_req, res) => res.send("ok"));
