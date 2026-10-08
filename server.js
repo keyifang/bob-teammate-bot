@@ -432,7 +432,17 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
     // opencode go reports the scratchpad as reasoning_content; OpenRouter as
     // reasoning. Reading only one leaves the other's in `content`, which is what
     // posts an internal monologue into a group chat.
-    if (message && typeof message.content === "string" && looksLikeReasoningLeak(message.content)) {
+    // A tool call the model wrote as text is NOT a scratchpad. It must survive
+    // to be executed - observed live, where this scrubber matched the markup,
+    // nulled `content`, and destroyed the very call that would have answered
+    // the question (web_fetch had just been blocked with a 403).
+    const isTextToolCall = typeof message?.content === "string" && parseTextToolCall(message.content);
+    if (
+      message &&
+      typeof message.content === "string" &&
+      looksLikeReasoningLeak(message.content) &&
+      !isTextToolCall
+    ) {
       console.error(`${label}: provider put the scratchpad in content; moving it to reasoning`);
       const scratchpad = message.reasoning_content ?? message.reasoning;
       message.reasoning = [scratchpad, message.content].filter(Boolean).join("\n");
@@ -798,43 +808,63 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
     hops++;
   }
 
-  // The model may write its tool call as TEXT instead of emitting it
-  // structurally - observed live, where it discarded fallback results it
-  // already had and emitted <tool_call> markup as the reply. Executing it is
-  // what the model meant, and it beats telling a user with the data in hand
-  // that it could not find it.
-  if (typeof choice?.message?.content === "string") {
+  // The hop budget is spent, but the model may still have written a tool call
+  // as TEXT on the last hop - observed live, where web_fetch was blocked (403),
+  // the model emitted <tool_call> markup as its content, and the loop exited
+  // before anything could act on it. The user got "hit an error" while the
+  // model was asking for exactly the page that would have answered.
+  //
+  // So the text-call path runs AFTER the loop as well as inside it: reaching
+  // here with a text tool call is not a reason to give up, it is one more
+  // attempt to answer.
+  for (let extra = 0; extra < 2; extra++) {
+    if (typeof choice?.message?.content !== "string") break;
     const asCall = parseTextToolCall(choice.message.content);
-    if (asCall) {
-      log(chatId, `executing a tool call the model wrote as text: ${asCall.name}`);
-      messages.push({ role: "user", content: choice.message.content });
-      let result;
-      const isSearch = asCall.name === "web_search" || asCall.name === "owl_research";
-      if (isSearch && !withinSearchBudget(plan, searchesUsed)) {
-        result = quotaMessage("research", plan);
-      } else {
-        if (isSearch) searchesUsed++;
-        try {
-          result = await executeTool(asCall.name, asCall.args);
-        } catch (err) {
-          result = `Tool failed: ${err.message}`;
-        }
+    if (!asCall) break;
+
+    log(chatId, `executing a tool call the model wrote as text: ${asCall.name}`);
+    messages.push({ role: "user", content: choice.message.content });
+    let result;
+    const isSearch = asCall.name === "web_search" || asCall.name === "owl_research";
+    if (isSearch && !withinSearchBudget(plan, searchesUsed)) {
+      result = quotaMessage("research", plan);
+    } else {
+      if (isSearch) searchesUsed++;
+      try {
+        result = await executeTool(asCall.name, asCall.args);
+      } catch (err) {
+        noteFailure("tool", `${asCall.name}: ${err.message}`, err?.stack);
+        result = `Tool failed: ${err.message}`;
       }
-      messages.push({ role: "user", content: `Tool ${asCall.name} returned:
-${String(result).slice(0, 6000)}` });
-      // One more call to turn the result into an actual answer.
-      data = await modelRequest(chatId, "reply after text tool call", {
-        model,
-        messages,
-        temperature: 0.7,
-        max_tokens: REPLY_MAX_TOKENS,
-      }, route, meter);
     }
+    // Bounded: a model that keeps writing new text calls must not loop forever.
+    messages.push({
+      role: "user",
+      content: `Tool ${asCall.name} returned:
+${String(result).slice(0, 6000)}`,
+    });
+    data = await modelRequest(chatId, "reply after text tool call", {
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: REPLY_MAX_TOKENS,
+    }, route, meter);
+    choice = data.choices[0];
   }
 
   try {
     return contentOf(data, { requireSubstance: true });
   } catch (err) {
+    // The model ran out of ways to phrase this as prose and kept writing tool
+    // calls. We have the tool RESULTS, so summarise them rather than telling the
+    // user "hit an error" - the answer is usually sitting in the transcript.
+    const lastResult = [...messages].reverse().find((m) => m.role === "tool")?.content;
+    if (lastResult && looksLikeReasoningLeak(String(data?.choices?.[0]?.message?.content ?? ""))) {
+      noteFailure("text-call-exhausted", "answered from tool results instead", err?.stack);
+      return `Here's what I found:
+
+${String(lastResult).slice(0, 1200)}`;
+    }
     // Recorded with the REASON, because "hit an error" tells an operator
     // nothing and this is where a rejected reply actually dies.
     noteFailure("content-rejected", err?.message, err?.stack);
