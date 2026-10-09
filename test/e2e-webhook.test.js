@@ -1142,7 +1142,10 @@ test("Phase 8: a pro-plan bot gets a larger search budget", { skip }, async () =
     { "X-Telegram-Bot-Api-Secret-Token": SECRET }
   );
 
-  await waitFor(() => sentTo(chatId).length > 0, { label: "a reply", timeout: 30000 });
+  // 8 tool calls through the stub, each a round trip: measured at ~30s. The
+  // default 20s is not enough under full-suite load, and a test that only
+  // passes when the machine is idle trains people to ignore red.
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a reply", timeout: 60000 });
 
   // Read the allowance from the plan rather than a literal: the stub asks for
   // more searches than free allows, so pro must be measured against ITS OWN

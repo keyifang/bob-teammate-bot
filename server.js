@@ -54,6 +54,9 @@ import {
   addCredits,
   getCreditLedger,
   claimPaymentEvent,
+  rememberFact,
+  recallFacts,
+  supersedeFact,
   saveProjectManifest,
   getProjectManifest,
   createBot,
@@ -66,6 +69,7 @@ import {
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { looksLikeInventedToolFailure } from "./guards.js";
+import { extractFacts, looksLikeCorrection, formatFacts } from "./memory.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay, normalizeBotName } from "./bots.js";
 import { modelForBot, modelChainFor, nextModelAfter } from "./model-config.js";
@@ -1136,9 +1140,22 @@ async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = ""
 
   // Stable-first: the persona is a constant, the summaries change rarely, and
   // only the turns change per message - so the cacheable prefix stays put.
+  // What the user has told us about themselves, from ANY chat. This is what
+  // turns a search box into a colleague: told about a peanut allergy in one
+  // group, Bob uses it in another.
+  const facts = await recallFacts(bot.owner_user_id ?? 0);
+  const factsBlock = formatFacts(facts);
+
   return orderForCache({
     persona: PERSONA_SYSTEM_PROMPT,
-    ownerSummary: ownerMemory,
+    // Facts sit high in the prompt so they are part of the CACHED prefix
+    // rather than something that changes per message.
+    // Facts ADD to tier C rather than replacing it: tier C is the rolling
+    // cross-chat summary and is still needed for everything a fact is not.
+    ownerSummary: [factsBlock ? "What you know about them:" + String.fromCharCode(10) + factsBlock : "",
+                  ownerMemory]
+      .filter(Boolean)
+      .join(String.fromCharCode(10, 10)),
     sessionSummary: summary,
     turns: buildTranscript(window),
     latest: [discussionBlock, `${senderName}: ${text}`].filter(Boolean).join("\n\n"),
@@ -2045,6 +2062,28 @@ async function handleNewMembers(msg, chatId) {
   return true;
 }
 
+/**
+ * Records facts the user stated, and retracts stale ones on a correction.
+ *
+ * Never throws: this runs on the reply path and a memory write must not be
+ * able to fail a reply.
+ */
+async function captureFacts(userId, chatId, text) {
+  if (looksLikeCorrection(text)) {
+    // A correction retracts whatever was learned most recently - it is a
+    // heuristic, but retracting too eagerly is recoverable while leaving a
+    // stale allergy on file is not.
+    const existing = await recallFacts(userId, 1);
+    for (const fact of existing) {
+      await supersedeFact(userId, fact, null).catch(() => {});
+    }
+    return;
+  }
+  for (const fact of extractFacts(text)) {
+    await rememberFact(userId, fact, chatId);
+  }
+}
+
 async function handleUpdate(update) {
   const msg = update?.message;
   if (!msg || !msg.chat) return;
@@ -2082,6 +2121,13 @@ async function handleUpdate(update) {
   }
 
   await insertMessage(chatId, sender.id, senderName, text);
+
+  // Learn anything the user states about themselves or the people around them.
+  // Backgrounded and failure-isolated: memory is an enhancement, and losing it
+  // must never cost the user their reply.
+  captureFacts(sender.id, chatId, text).catch((err) =>
+    console.error("Fact capture failed:", err.message)
+  );
 
   // Any new message supersedes a relay turn still in flight, so a human can
   // always interject instead of waiting for a slow model. If this message is

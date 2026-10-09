@@ -31,6 +31,8 @@ const ALLOWED_UNCALLED = new Set([
   // The pure ledger arithmetic is exercised through addCredits; exported so the
   // arithmetic can be tested without a database.
   "balanceAfter",
+  // forgetFact is exposed for a future /forget command; unused until then.
+  "forgetFact",
 ]);
 
 const sources = new Map();

@@ -573,3 +573,85 @@ test("persona bots have no telegram id and many can coexist", { skip }, async ()
   assert.equal(await db.getBotByTelegramUserId(null), null);
 });
 
+// --- Facts the user has stated -----------------------------------------------
+
+const FACT_USER = 710000009;
+const FACT_CHAT_A = 910000009;
+const FACT_CHAT_B = 910000010;
+
+test("a stated fact is remembered and recalled across chats", { skip }, async () => {
+  await db.upsertUser(FACT_USER, "Fact User");
+  await db.getOrCreateChat(FACT_CHAT_A, "Chat A");
+  await db.getOrCreateChat(FACT_CHAT_B, "Chat B");
+
+  // Cleared first: these tests share a database with the rest of the suite and
+  // test order is not guaranteed, so an empty start must be ARRANGED rather
+  // than assumed. forgetFact takes the fact text, which is why this reads the
+  // rows first.
+  const { rows: prior } = await admin.query(
+    "SELECT fact FROM user_facts WHERE user_id = $1",
+    [FACT_USER]
+  );
+  for (const r of prior) await db.forgetFact(FACT_USER, r.fact);
+
+  assert.deepEqual(await db.recallFacts(FACT_USER), [], "starts empty");
+
+  await db.rememberFact(FACT_USER, "Allergic to peanuts", FACT_CHAT_A);
+
+  // The point of the feature: the user is the same person in every group, so a
+  // fact learned in one must be available in all of them.
+  const recalled = await db.recallFacts(FACT_USER);
+  assert.deepEqual(recalled, ["Allergic to peanuts"]);
+});
+
+test("re-stating a fact refreshes it rather than duplicating it", { skip }, async () => {
+  await db.rememberFact(FACT_USER, "Allergic to peanuts", FACT_CHAT_B);
+  const { rows } = await admin.query(
+    `SELECT mentioned_count FROM user_facts
+      WHERE user_id = $1 AND fact = $2 AND superseded_by IS NULL`,
+    [FACT_USER, "Allergic to peanuts"]
+  );
+  assert.equal(rows.length, 1, "exactly one live row");
+  assert.ok(rows[0].mentioned_count >= 2, `mentioned_count was ${rows[0].mentioned_count}`);
+});
+
+test("a corrected fact stops being recalled but its history remains", { skip }, async () => {
+  await db.rememberFact(FACT_USER, "Partner is Sam", FACT_CHAT_A);
+  assert.equal(await db.supersedeFact(FACT_USER, "Partner is Sam", "Partner is Alex"), true);
+
+  const recalled = await db.recallFacts(FACT_USER);
+  assert.ok(!recalled.includes("Partner is Sam"), "the stale fact must stop being recalled");
+  assert.ok(recalled.includes("Partner is Alex"), "and the replacement be recalled");
+
+  // Retained, not deleted: what was believed and when stays inspectable.
+  const { rows } = await admin.query(
+    "SELECT superseded_by FROM user_facts WHERE user_id = $1 AND fact = $2",
+    [FACT_USER, "Partner is Sam"]
+  );
+  assert.ok(rows[0].superseded_by !== null, "history must be kept");
+});
+
+test("forgetFact removes a fact outright", { skip }, async () => {
+  await db.rememberFact(FACT_USER, "Temporary note", FACT_CHAT_A);
+  assert.equal(await db.forgetFact(FACT_USER, "Temporary note"), true);
+  assert.ok(!(await db.recallFacts(FACT_USER)).includes("Temporary note"));
+  // Removing something that is not there is not an error.
+  assert.equal(await db.forgetFact(FACT_USER, "never existed"), false);
+});
+
+test("facts are per user, never shared", { skip }, async () => {
+  const other = 710000010;
+  await db.upsertUser(other, "Other User");
+  await db.rememberFact(other, "Allergic to shellfish", FACT_CHAT_A);
+
+  const mine = await db.recallFacts(FACT_USER);
+  const theirs = await db.recallFacts(other);
+  assert.ok(!mine.includes("Allergic to shellfish"), "one user's fact must not leak into another's");
+  assert.ok(theirs.includes("Allergic to shellfish"));
+});
+
+test("a blank fact is refused rather than stored as empty noise", { skip }, async () => {
+  assert.equal(await db.rememberFact(FACT_USER, "", FACT_CHAT_A), null);
+  assert.equal(await db.rememberFact(FACT_USER, "   ", FACT_CHAT_A), null);
+  assert.equal(await db.rememberFact(FACT_USER, null, FACT_CHAT_A), null);
+});
