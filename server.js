@@ -70,6 +70,8 @@ import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { looksLikeInventedToolFailure } from "./guards.js";
 import { extractFacts, looksLikeCorrection, formatFacts } from "./memory.js";
+import { routeFor } from "./router.js";
+import { shouldSpeak, CONFIDENT_NOISE } from "./speak.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay, normalizeBotName } from "./bots.js";
 import { modelForBot, modelChainFor, nextModelAfter } from "./model-config.js";
@@ -360,7 +362,12 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
   // all calls to a saturated model fail. So exhausting one model and moving to
   // the next recovers most of that. This matters more than any agent
   // architecture: every extra call is another chance to fail.
-  const chain = modelChainFor(payload.model);
+  // The router supplies a task-specific chain when it has one; otherwise the
+  // shared chain from the configured model. Either way the first entry is the
+  // model asked for, and exhausting it moves down rather than failing.
+  const chain = Array.isArray(route.sessionChain) && route.sessionChain.length
+    ? route.sessionChain
+    : modelChainFor(payload.model);
   let currentModel = chain[0] ?? payload.model;
 
   for (let attempt = 0; attempt < OVERLOAD_MAX_ATTEMPTS; attempt++) {
@@ -946,6 +953,9 @@ ${String(result).slice(0, 6000)}`,
   }
 
   try {
+    // The last real tool output, kept for the caller: a reply that invents a
+    // limitation is replaced with this rather than shown to the user.
+    route.toolOutput = lastToolResultText(messages);
     const text = contentOf(data, { requireSubstance: true });
     // The invented-failure guard belongs HERE, in the tool loop, because that is
     // the only place that knows whether a tool genuinely failed. The model does
@@ -1085,9 +1095,17 @@ async function sendBobReply(chatId, senderId, userPrompt, tagUnsolicited, finali
     clearInterval(typingPing);
   }
 
-  const finalText = finalize
-    ? finalize(await humanize(chatId, reply, model, route))
-    : await humanize(chatId, reply, model, route);
+  const humanized = await humanize(chatId, reply, model, route);
+
+  // A reply that claims a tool limitation which never happened is worse than no
+  // reply: the user reads it as a broken product. Where we have the tool output
+  // to fall back on, use it instead.
+  const usable =
+    CONFIDENT_NOISE.test(humanized) && route.toolOutput
+      ? String(route.toolOutput).trim()
+      : humanized;
+
+  const finalText = finalize ? finalize(usable) : usable;
   await sendFormatted(chatId, finalText);
 
   await insertMessage(chatId, senderId, BOB_NAME, finalText);
@@ -1461,11 +1479,20 @@ async function meterUsage(route, costMicro) {
 // Triggering
 // ---------------------------------------------------------------------------
 
+// Whether Bob joins an unaddressed group message.
+//
+// Was: a question mark plus a cooldown, so he interjected on ANY question to
+// ANYONE. Now: only when he can genuinely help, or when named directly. A
+// question about the weather is his business unprompted; a question about Maya's
+// weekend is not.
 async function shouldReplyUnsolicited(chatId, text) {
   const last = await getLastUnsolicitedReply(chatId);
-  if (Date.now() - last < COOLDOWN_MS) return false;
-  const looksLikeQuestion = text.trim().endsWith("?");
-  return Math.random() < (looksLikeQuestion ? 0.6 : 0.1);
+  return shouldSpeak({
+    text,
+    addressed: false,
+    lastSpokeAt: last,
+    cooldownMs: COOLDOWN_MS,
+  });
 }
 
 function isBotUsername(username) {
@@ -2271,7 +2298,12 @@ async function handleUpdate(update) {
       firstContact: claimed,
     });
 
-    const senderRoute = await routeForUser(sender.id, sessionIdFor(null, chatId));
+    // Task routing: a group aside gets the fast, measured-reliable model; a
+    // proposal gets the stronger one. Previously every message went to the same
+    // model, so "ok cool" paid reasoning-model latency.
+    const task = routeFor(text);
+    const userRoute = await routeForUser(sender.id, sessionIdFor(null, chatId));
+    const senderRoute = { ...userRoute, model: task.model, sessionChain: task.chain };
     try {
       await sendBobReply(
         chatId,
