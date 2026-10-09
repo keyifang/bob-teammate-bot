@@ -372,3 +372,52 @@ test("a python backend failure falls through to the scraped endpoints", async ()
     delete process.env.SEARCH_PYTHON_BIN;
   }
 });
+
+// The weather tool exists because the search path CANNOT answer a weather
+// question from this host.
+//
+// Observed live: the search returns AccuWeather and EaseWeather, and BOTH
+// answer 403 to a datacenter IP. No User-Agent changes that. The model searched,
+// failed to fetch, and answered a Melbourne weather question with Wikipedia
+// links - relevant to nothing that was asked.
+test("the weather tool is advertised and returns real current conditions", async () => {
+  const { runWeather } = await import("../tools.js");
+  const out = await runWeather("Melbourne, Australia");
+  assert.match(out, /Melbourne/, `the place must be named back: ${out}`);
+  assert.match(out, /\d+(\.\d+)?°C/, "a real temperature must be present");
+  // Not a weather code - the model would either guess or quote a number.
+  assert.match(out, /Clear|cloud|Drizzle|Rain|Snow|Fog|Overcast|Thunderstorm|Hail|showers/i);
+  assert.ok(!/code \d+/.test(out), "WMO codes must be translated to English");
+});
+
+test("the weather tool needs no key and fails gracefully on a bad place", async () => {
+  const { runWeather } = await import("../tools.js");
+  const missing = await runWeather("Nowhereville");
+  assert.match(missing, /Could not find|Try adding a country/i, `must explain itself: ${missing}`);
+  // Never throws into the tool loop, which would kill the whole reply.
+  assert.equal(typeof missing, "string");
+
+  const empty = await runWeather("");
+  assert.match(empty, /No location/i);
+});
+
+test("the weather tool is dispatched, not just defined", async () => {
+  const { executeTool, TOOL_SCHEMAS } = await import("../tools.js");
+  const schema = TOOL_SCHEMAS.find((t) => t.function.name === "weather");
+  assert.ok(schema, "the schema must exist or the model never sees it");
+  assert.deepEqual(schema.function.parameters.required, ["location"]);
+
+  // Unknown tools must still throw, so a typo is not silently swallowed.
+  await assert.rejects(() => executeTool("nope", {}), /Unknown tool/);
+});
+
+test("the persona points weather questions at the weather tool", async () => {
+  const { PERSONA_SYSTEM_PROMPT } = await import("../config.js");
+  assert.match(PERSONA_SYSTEM_PROMPT, /weather:/i, "the tool must be listed");
+  // The old text told the model to SEARCH for weather, which is the exact path
+  // that fails. That contradiction must not come back.
+  assert.ok(
+    !/web_search:[^.]*weather/s.test(PERSONA_SYSTEM_PROMPT),
+    "the persona must not tell the model to search for weather"
+  );
+});

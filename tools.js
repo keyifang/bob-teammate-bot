@@ -37,6 +37,24 @@ export const TOOL_SCHEMAS = [
   {
     type: "function",
     function: {
+      name: "weather",
+      description:
+        "Get the CURRENT weather for a city: temperature, feels-like, humidity, wind and a plain-English description. Use this for ANY weather question. It is fast, reliable and needs no key, so prefer it over searching and fetching weather sites - most news and weather sites block automated requests and will fail.",
+      parameters: {
+        type: "object",
+        properties: {
+          location: {
+            type: "string",
+            description: "City name, optionally with a country code, e.g. 'Melbourne' or 'Melbourne, Australia'",
+          },
+        },
+        required: ["location"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "web_search",
       description:
         "Search the web and get titles, URLs and snippets. Use this for anything time-sensitive or that may have changed - current prices, recent releases, today's news, scores, who won. Use it before answering from memory when the facts could be out of date.",
@@ -246,6 +264,79 @@ export async function runOwlResearch(query) {
   const data = await res.json();
   // Adjust this to match OWL's actual response shape
   return data.result ?? data.answer ?? JSON.stringify(data);
+}
+
+// Open-Meteo WMO weather codes, so the model gets "Partly cloudy" rather
+// than "code 2". Without this the model either guesses or repeats a number.
+const WMO = {
+  0: "Clear sky",
+  1: "Mainly clear",
+  2: "Partly cloudy",
+  3: "Overcast",
+  45: "Fog",
+  48: "Freezing fog",
+  51: "Light drizzle",
+  53: "Drizzle",
+  55: "Heavy drizzle",
+  61: "Light rain",
+  63: "Rain",
+  65: "Heavy rain",
+  71: "Light snow",
+  73: "Snow",
+  75: "Heavy snow",
+  80: "Rain showers",
+  81: "Rain showers",
+  82: "Violent rain showers",
+  85: "Snow showers",
+  95: "Thunderstorm",
+  96: "Thunderstorm with hail",
+  99: "Thunderstorm with heavy hail",
+};
+
+/**
+ * Current weather for a city, via Open-Meteo.
+ *
+ * Added because the search path cannot answer a weather question from this
+ * host: the sites search returns (AccuWeather, EaseWeather) both answer 403 to
+ * datacenter IPs, and no User-Agent changes that. Observed live as Bob
+ * answering a Melbourne weather question with Wikipedia links, because it
+ * searched, failed to fetch, and wandered.
+ *
+ * Chosen over wttr.in as the primary because it is a documented API rather
+ * than a scraping-friendly front end, and it needs no key.
+ */
+export async function runWeather(location) {
+  const place = String(location ?? "").trim();
+  if (!place) return "No location was given.";
+
+  const geoRes = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1`,
+    { signal: AbortSignal.timeout(12000) }
+  );
+  if (!geoRes.ok) return `Could not look up "${place}" (geocoding returned ${geoRes.status}).`;
+  const geo = await geoRes.json();
+  const hit = geo?.results?.[0];
+  if (!hit) return `Could not find a place called "${place}". Try adding a country, e.g. "Melbourne, Australia".`;
+
+  const wxRes = await fetch(
+    `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${hit.latitude}&longitude=${hit.longitude}` +
+      `&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m` +
+      `&timezone=auto&forecast_days=1`,
+    { signal: AbortSignal.timeout(12000) }
+  );
+  if (!wxRes.ok) return `Weather lookup failed for ${place} (${wxRes.status}).`;
+  const wx = await wxRes.json();
+  const c = wx?.current;
+  if (!c) return `No current conditions returned for ${place}.`;
+
+  const desc = WMO[c.weather_code] ?? `Conditions code ${c.weather_code}`;
+  const place_ = [hit.name, hit.admin1, hit.country_code].filter(Boolean).join(", ");
+  return [
+    `Current weather for ${place_}: ${c.temperature_2m}°C (feels like ${c.apparent_temperature}°C), ${desc}.`,
+    `Humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h` +
+      (c.precipitation ? `, precipitation ${c.precipitation} mm` : ", no precipitation") + ".",
+  ].join(" ");
 }
 
 export async function runWebFetch(rawUrl) {
@@ -572,6 +663,7 @@ function decodeEntities(s) {
 
 export async function executeTool(name, args = {}) {
   if (name === "owl_research") return await runOwlResearch(args.query);
+  if (name === "weather") return await runWeather(args.location);
   if (name === "web_search") return await runDdgSearch(args.query, args.max_results);
   if (name === "web_fetch") return await runWebFetch(args.url);
   throw new Error(`Unknown tool: ${name}`);

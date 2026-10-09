@@ -771,13 +771,21 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
 
     for (const call of choice.message.tool_calls) {
       const count = noteToolCall(call.function.name);
-      log(chatId, `tool call: ${call.function.name} (call #${count})`);
       let args = {};
       try {
         args = JSON.parse(call.function.arguments ?? "{}");
       } catch {
         args = {};
       }
+
+      // Log the TARGET, not just the tool name. Observed live: three
+      // web_fetch calls in a row with nothing logged about WHAT they fetched,
+      // which made a model that had lost the thread indistinguishable from one
+      // that was working correctly.
+      log(
+        chatId,
+        `tool call: ${call.function.name} ${JSON.stringify(args).slice(0, 160)} (call #${count})`
+      );
 
       let result;
       const isSearch = call.function.name === "web_search" || call.function.name === "owl_research";

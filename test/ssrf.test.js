@@ -65,7 +65,10 @@ test("web_fetch is always advertised and is never an open proxy", async () => {
   const names = TOOL_SCHEMAS.map((t) => t.function.name);
   assert.ok(names.includes("web_fetch"), "web_fetch must always be advertised");
   assert.ok(names.includes("web_search"), "web_search must always be advertised");
-  const allowed = new Set(["web_fetch", "web_search", "owl_research"]);
+  // weather is a bounded API call to a fixed host, not a user-supplied URL, so
+  // it carries no SSRF surface - but it must stay in the allowlist or this test
+  // would not notice a tool being added that DOES take a URL.
+  const allowed = new Set(["web_fetch", "web_search", "owl_research", "weather"]);
   assert.ok(
     names.every((n) => allowed.has(n)),
     `unexpected tool advertised: ${names.join(", ")}`
