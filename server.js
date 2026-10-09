@@ -65,6 +65,7 @@ import {
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
+import { looksLikeInventedToolFailure } from "./guards.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay, normalizeBotName } from "./bots.js";
 import { modelForBot, modelChainFor, nextModelAfter } from "./model-config.js";
@@ -767,6 +768,10 @@ async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODE
   // plan by spreading the calls out.
   const hopBudget = allowedHops(plan);
   let searchesUsed = 0;
+  // Whether a tool genuinely errored. The reply guard needs this: a model may
+  // claim throttling that never happened (observed live), and that is only
+  // detectable from outside the model.
+  let anyToolFailed = false;
 
   // Whether this model accepts tools. opencode go's support cannot be verified
   // without a key, so the first refusal is detected and remembered for the
@@ -921,7 +926,23 @@ ${String(result).slice(0, 6000)}`,
   }
 
   try {
-    return contentOf(data, { requireSubstance: true });
+    const text = contentOf(data, { requireSubstance: true });
+    // The invented-failure guard belongs HERE, in the tool loop, because that is
+    // the only place that knows whether a tool genuinely failed. The model does
+    // not, and will invent a failure it never received.
+    if (looksLikeInventedToolFailure(text, { anyToolFailed })) {
+      const real = lastToolResultText(messages);
+      if (real) {
+        log(chatId, "reply claimed a tool failure that never happened; using the tool output");
+        return real;
+      }
+      noteFailure(
+        "invented-failure",
+        text.slice(0, 160),
+        "no tool output existed, so the claim was invented"
+      );
+    }
+    return text;
   } catch (err) {
     // The model ran out of ways to phrase this as prose and kept writing tool
     // calls. We have the tool RESULTS, so summarise them rather than telling the
@@ -938,6 +959,21 @@ ${String(lastResult).slice(0, 1200)}`;
     noteFailure("content-rejected", err?.message, err?.stack);
     throw err;
   }
+}
+
+// The last real tool output, so an invented "throttled" claim can be replaced
+// with the data the tools actually returned. Null when nothing ran, which is
+// itself the evidence that the claim was invented.
+function lastToolResultText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role === "tool" && typeof m.content === "string") {
+      const t = m.content.trim();
+      // A tool FAILURE message is not data; it would just repeat the excuse.
+      if (t && !/^Tool failed:/i.test(t)) return t;
+    }
+  }
+  return null;
 }
 
 // The humanizer is a full extra model call per reply. On a free reasoning model

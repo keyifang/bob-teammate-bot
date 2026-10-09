@@ -271,3 +271,63 @@ test("the nested JSON form still parses after adding the flat one", async () => 
   assert.equal(call.name, "web_search");
   assert.equal(call.args.query, "psi");
 });
+
+// An invented tool failure must not reach the user.
+//
+// OBSERVED live (2026-10-08): asked for Beijing weather, Bob replied "Weather
+// tool and search are both throttled right now - can't get live Beijing data.
+// Check wttr.in/Beijing or weather.com ... they don't need an API key."
+//
+// The weather tool had never been called, and it works. The model invented a
+// failure, then recommended a workaround. The persona forbade claiming a tool
+// was rate-limited "unless it actually said so", but that clause sat under
+// "when one tool fails" - so with no failure the model felt licensed.
+//
+// This is enforceable rather than merely promptable: the caller knows whether
+// any tool actually failed.
+test("a claim of throttling is caught when no tool actually failed", async () => {
+  const { looksLikeInventedToolFailure } = await import("../guards.js");
+  const claims = [
+    "Weather tool and search are both throttled right now - can't get live data.",
+    "I'm hitting a rate limit on my searches at the moment.",
+    "The API is unavailable right now, so I can't look that up.",
+    "That source is blocked for me right now.",
+  ];
+  for (const c of claims) {
+    assert.equal(looksLikeInventedToolFailure(c, { anyToolFailed: false }), true, `must catch: ${c.slice(0, 45)}`);
+  }
+});
+
+test("the guard stands down when a tool genuinely failed", async () => {
+  const { looksLikeInventedToolFailure } = await import("../guards.js");
+  const claim = "The weather tool is throttled right now.";
+  assert.equal(
+    looksLikeInventedToolFailure(claim, { anyToolFailed: true }),
+    false,
+    "a real failure may legitimately be reported"
+  );
+});
+
+test("an ordinary answer mentioning a limit is not treated as an excuse", async () => {
+  const { looksLikeInventedToolFailure } = await import("../guards.js");
+  const fine = [
+    "Sydney's hitting 39 degrees today, so the heat limit is worth watching.",
+    "That limit changed last year - the free tier now allows more.",
+  ];
+  for (const f of fine) {
+    assert.equal(looksLikeInventedToolFailure(f, { anyToolFailed: false }), false, `false positive: ${f.slice(0, 45)}`);
+  }
+});
+
+test("an ordinary answer is never rejected", async () => {
+  const { looksLikeInventedToolFailure } = await import("../guards.js");
+  for (const ok of [
+    "Beijing right now: 21C, partly cloudy, feels like 20C.",
+    "Tokyo's currently 19C and clear skies.",
+    "",
+    null,
+    undefined,
+  ]) {
+    assert.equal(typeof looksLikeInventedToolFailure(ok, { anyToolFailed: false }), "boolean");
+  }
+});
