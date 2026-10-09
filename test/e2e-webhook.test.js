@@ -138,7 +138,9 @@ function startStub() {
                     message: {
                       role: "assistant",
                       content: null,
-                      tool_calls: [1, 2].map((n) => ({
+                      // Sized to exceed the FREE plan allowance, so the cap is genuinely
+                      // exercised rather than trivially satisfied.
+                      tool_calls: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({
                         id: `call_${n}`,
                         type: "function",
                         function: {

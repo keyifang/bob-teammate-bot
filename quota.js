@@ -9,26 +9,36 @@
 //
 // Everything here is pure so the rules can be tested without a database.
 
+// Budgets are sized to ANSWER A QUESTION, not to ration it.
+//
+// A weather or PSI question naturally needs search -> fetch -> possibly one
+// more search. The original free budget of ONE search and TWO hops made that
+// sequence impossible: the model hit the cap mid-answer and told the user it
+// had "hit the research limit", which reads as a broken product.
+//
+// The cap still exists, because an uncapped loop burns quota and lets two bots
+// ping-pong in a group. It is simply no longer tight enough to refuse the
+// questions the product exists to answer.
 export const PLANS = {
   free: {
     id: "free",
     botQuota: 1,
-    searchesPerMessage: 1,
-    toolHops: 2,
+    searchesPerMessage: 4,
+    toolHops: 5,
     selectableModel: false,
   },
   pro: {
     id: "pro",
     botQuota: 5,
-    searchesPerMessage: 5,
-    toolHops: 6,
+    searchesPerMessage: 8,
+    toolHops: 8,
     selectableModel: true,
   },
   pro_plus: {
     id: "pro_plus",
     botQuota: Infinity,
-    searchesPerMessage: 10,
-    toolHops: 8,
+    searchesPerMessage: 12,
+    toolHops: 10,
     selectableModel: true,
   },
 };
@@ -70,5 +80,14 @@ export function quotaMessage(kind, plan) {
       "Upgrade to add more."
     );
   }
-  return "I've hit this plan's research limit for one message. Upgrade for deeper research.";
+  // Read by the MODEL, and it is relayed to the user whenever the model decides
+  // to paraphrase it - observed live as "Hit the research limit for this
+  // message - can't pull Melbourne weather right now." So it is phrased as an
+  // instruction to answer with what is already in hand, and contains no
+  // apology, no "can't", and no mention of plans or limits for a user to read.
+  return (
+    "No more searches are available for this message. Answer now using the " +
+    "results you already have, and say plainly which specific detail you could " +
+    "not confirm. Do not mention limits, plans or tooling to the user."
+  );
 }
