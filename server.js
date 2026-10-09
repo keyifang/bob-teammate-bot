@@ -560,6 +560,30 @@ function parseTextToolCall(text) {
     }
   }
 
+  // Flat form, observed live: the model wrote a whole extra paragraph of
+  // preamble and then a bare {"tool":"web_search","query":"..."}. Different key,
+  // arguments inline rather than nested, and often preceded by prose.
+  const flatMatch = visible.match(
+    /\{\s*"(?:tool|tool_name|function)"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,([\s\S]*?)\}/i
+  );
+  if (flatMatch) {
+    const args = {};
+    const argRe = /"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"([^"]*)"/g;
+    let am;
+    while ((am = argRe.exec(flatMatch[2])) !== null) {
+      args[am[1]] = am[2];
+    }
+    // {"tool":"web_search","max_results":5} - a numeric argument, same coercion.
+    const numRe = /"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*(\d+(?:\.\d+)?)/g;
+    let nm;
+    while ((nm = numRe.exec(flatMatch[2])) !== null) {
+      args[nm[1]] = Number(nm[2]);
+    }
+    if (Object.keys(args).length) {
+      return { name: flatMatch[1], args };
+    }
+  }
+
   if (!TOOL_CALL_MARKUP_RE.test(visible)) return null;
 
   // <function=name> ... <parameter=key>value</parameter> ...

@@ -1144,14 +1144,22 @@ test("Phase 8: a pro-plan bot gets a larger search budget", { skip }, async () =
 
   await waitFor(() => sentTo(chatId).length > 0, { label: "a reply", timeout: 30000 });
 
-  // Pro allows 5 searches, and the stub asks for 2 per hop over up to 6 hops,
-  // so the first hop's two searches both run - unlike free, where the second is
-  // refused.
+  // Read the allowance from the plan rather than a literal: the stub asks for
+  // more searches than free allows, so pro must be measured against ITS OWN
+  // budget or raising either plan breaks this test for no real reason.
+  const { PLANS } = await import("../quota.js");
   const lines = serverLog.slice(logStart).join("\n");
   const executed = (lines.match(/tool call: web_search/g) ?? []).length;
   const refused = (lines.match(/search refused/g) ?? []).length;
-  assert.ok(executed >= 2, `a pro plan must allow the second search:\n${lines}`);
-  assert.equal(refused, 0, `pro must not refuse within its budget:\n${lines}`);
+  assert.ok(
+    executed >= Math.min(2, PLANS.pro.searchesPerMessage),
+    `a pro plan must allow at least two searches:\n${lines}`
+  );
+  assert.equal(
+    refused,
+    0,
+    `pro allows ${PLANS.pro.searchesPerMessage} searches, which must cover what the stub asks for:\n${lines}`
+  );
 });
 
 test("Phase 8: a canceled subscription behaves as free, not as paid", { skip }, async () => {

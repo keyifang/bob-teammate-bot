@@ -239,3 +239,35 @@ test("a parsed call names a tool that actually exists", async () => {
   );
 });
 
+// A FLAT JSON call, preceded by prose.
+//
+// OBSERVED live (2026-10-08): asked for Melbourne weather, the model replied
+// "I'll check the current weather in Melbourne for you." followed by a bare
+//     {"tool": "web_search", "query": "Melbourne weather today"}
+// The earlier parser only understood {"name":..., "arguments":{...}}, so this
+// was treated as prose and the user got a refusal instead of an answer.
+test("a flat JSON tool call, even after preamble, is parsed", async () => {
+  const parse = await parser();
+  const call = parse(
+    "I'll check the current weather in Melbourne for you." + NL +
+    '{"tool": "web_search", "query": "Melbourne weather today"}'
+  );
+  assert.ok(call, "this shape must be recognised as the call the model meant to make");
+  assert.equal(call.name, "web_search");
+  assert.equal(call.args.query, "Melbourne weather today");
+});
+
+test("a flat JSON call with a numeric argument coerces the number", async () => {
+  const parse = await parser();
+  const call = parse('{"tool":"web_fetch","url":"https://x.test","max_results":5}');
+  assert.equal(call.name, "web_fetch");
+  assert.equal(call.args.url, "https://x.test");
+  assert.strictEqual(call.args.max_results, 5);
+});
+
+test("the nested JSON form still parses after adding the flat one", async () => {
+  const parse = await parser();
+  const call = parse('{"name":"web_search","arguments":{"query":"psi"}}');
+  assert.equal(call.name, "web_search");
+  assert.equal(call.args.query, "psi");
+});
