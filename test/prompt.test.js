@@ -186,3 +186,31 @@ test("with no discussion, nothing is invented", () => {
   assert.ok(!/Others have already answered/.test(prompt));
   assert.ok(!prompt.includes("undefined"));
 });
+
+// A first-contact greeting must not displace the answer.
+//
+// OBSERVED live (2026-10-08): a brand new DM asking "what is the weather in
+// Beijing right now?" got "Nice to meet you - I'm Bob, the AI teammate" and
+// NOTHING about the weather. The instruction said to greet "in 2-3 sentences,
+// AND THEN answer" - and on a short reply budget the greeting consumes it all.
+test("first contact asks for the answer first, then a greeting", () => {
+  const p = buildReplyPrompt({ bobName: "Bob", firstContact: true, latest: "what is the weather in Beijing?" });
+  const section = p.split(String.fromCharCode(10, 10)).find((s) => /first message/i.test(s)) ?? "";
+  assert.match(section, /answer/i, "the answer must be asked for");
+  // The answer must come FIRST: a greeting-first instruction reliably loses.
+  const greetIdx = section.search(/greet/i);
+  const answerIdx = section.search(/answer/i);
+  assert.ok(answerIdx >= 0, "must ask for the answer");
+  assert.ok(
+    greetIdx === -1 || answerIdx < greetIdx,
+    `the answer must be requested before the greeting: ${section}`
+  );
+});
+
+test("the first-contact instruction does not ask for 2-3 sentences of greeting", () => {
+  const p = buildReplyPrompt({ bobName: "Bob", firstContact: true });
+  assert.ok(
+    !/in 2-3 sentences/i.test(p),
+    "budgeting 2-3 sentences for a greeting leaves none for the answer"
+  );
+});

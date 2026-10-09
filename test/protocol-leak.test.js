@@ -370,3 +370,34 @@ test("a real reply is never mistaken for narration", async () => {
     assert.equal(leak(t), false, `false positive: ${t.slice(0, 45)}`);
   }
 });
+
+// A detected leak should not cost the user their answer.
+//
+// Observed live: asked about morning-rush staffing, Bob narrated "The user is
+// asking about staffing concerns... This is a follow-up to..." and the reply was
+// discarded for "hit an error". Detecting the leak is only half the job - the
+// narration often wraps a usable answer, so the answer must survive.
+test("narration can be stripped so the answer survives", async () => {
+  const { stripNarration } = await import("../guards.js");
+  const narrated =
+    'The user is asking about staffing for a morning rush. This is a follow-up. ' +
+    "For a morning rush, two staff is the usual minimum: one on the machine, one on the till.";
+  const stripped = stripNarration(narrated);
+  assert.ok(!/the user is asking/i.test(stripped), `narration remains: ${stripped}`);
+  assert.ok(/two staff is the usual minimum/i.test(stripped), "the answer must survive");
+});
+
+test("stripping narration leaves a clean reply untouched", async () => {
+  const { stripNarration } = await import("../guards.js");
+  for (const t of [
+    "For a morning rush, two staff is the usual minimum: one on the machine, one on the till.",
+    "hey bob, what's the weather in Beijing",
+    "",
+  ]) {
+    assert.equal(typeof stripNarration(t), "string");
+  }
+  assert.equal(
+    stripNarration("For a morning rush, two staff is the usual minimum."),
+    "For a morning rush, two staff is the usual minimum."
+  );
+});

@@ -86,3 +86,35 @@ test("the persona prompt does not invite a human impression", () => {
   // "the group already knows this" is fine; instructing deception is not.
   assert.ok(!/pretend to be human|act human|don't mention you are an ai/i.test(PERSONA_SYSTEM_PROMPT));
 });
+
+// A real reply must end up with exactly ONE disclosure.
+//
+// The disclosure is applied AFTER the humanizer, so a humanizer that rewords the
+// sentence just enough to stop the regex matching would cause a SECOND one to be
+// appended. Observed live as "...open: I'm an AI. Also, so it's out in the open:
+// I'm an AI."
+test("a real reply gets exactly one disclosure, never two", async () => {
+  const { ensureAiDisclosure, AI_DISCLOSURE_SENTENCE } = await import("../config.js");
+  for (const t of [
+    "Beijing: 19.2C, overcast.",
+    "It's 19.1C and overcast in Beijing right now.",
+    "Lisbon is the capital of Portugal.",
+  ]) {
+    const once = ensureAiDisclosure(t);
+    const twice = ensureAiDisclosure(once);
+    assert.equal(twice, once, `disclosure duplicated for: ${t}`);
+    assert.equal(once.split(AI_DISCLOSURE_SENTENCE).length - 1, 1, `not exactly one for: ${t}`);
+  }
+});
+
+test("a reply the humanizer already made self-identifying gets no second one", async () => {
+  const { ensureAiDisclosure, AI_DISCLOSURE_SENTENCE } = await import("../config.js");
+  // The humanizer sometimes volunteers it, in its own words.
+  for (const t of [
+    "It's 19.1C and overcast. I'm an AI teammate, by the way.",
+    "19C in Beijing. I'm an AI, so my weather data may lag.",
+  ]) {
+    const out = ensureAiDisclosure(t);
+    assert.ok(!out.includes(AI_DISCLOSURE_SENTENCE), `duplicated for: ${t}`);
+  }
+});

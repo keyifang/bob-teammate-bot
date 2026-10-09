@@ -44,3 +44,36 @@ export function looksLikeInventedToolFailure(text, { anyToolFailed = false } = {
   if (anyToolFailed) return false;
   return ACCESS_CLAIM_RE.test(text);
 }
+// Narration wrappers, used to cut a reply loose from its scratchpad rather than
+// discarding the answer inside it.
+//
+// OBSERVED live (2026-10-08): asked about morning-rush staffing, Bob replied
+// "The user is asking about staffing concerns ... This is a follow-up to the
+// previous conversation ...". Detecting that and rejecting the whole reply left
+// the user with "hit an error" for a perfectly good question - and the useful
+// half, "two staff is the usual minimum", was thrown away with it.
+//
+// Detection alone is half a fix. This keeps the answer.
+const NARRATION_LEAD_RE =
+  /^\s*(?:the user (?:is asking|wants|asked)|we need to respond|i need to respond (?:as|for)|this is a follow-?up|the style rules say|as per the (?:style )?rules)\b[^.]*\.?\s*/i;
+
+export function stripNarration(text) {
+  if (typeof text !== "string") return "";
+  let out = text.trim();
+
+  // Drop leading narration sentences, repeatedly: they chain ("The user is
+  // asking ... This is a follow-up ... As per the rules ...").
+  for (let i = 0; i < 5; i++) {
+    const before = out;
+    out = out.replace(NARRATION_LEAD_RE, "").trim();
+    if (out === before) break;
+  }
+
+  // A trailing "this is a follow-up to ..." also reads as scratchpad.
+  out = out.replace(
+    /\s*(?:this is a (?:follow-?up|continuation)[^.]*\.?)\s*$/i,
+    ""
+  ).trim();
+
+  return out;
+}

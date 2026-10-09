@@ -68,7 +68,7 @@ import {
 } from "./db.js";
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
-import { looksLikeInventedToolFailure } from "./guards.js";
+import { looksLikeInventedToolFailure, stripNarration } from "./guards.js";
 import { extractFacts, looksLikeCorrection, formatFacts } from "./memory.js";
 import { routeFor } from "./router.js";
 import { shouldSpeak, CONFIDENT_NOISE } from "./speak.js";
@@ -976,7 +976,19 @@ ${String(result).slice(0, 6000)}`,
     // The last real tool output, kept for the caller: a reply that invents a
     // limitation is replaced with this rather than shown to the user.
     route.toolOutput = lastToolResultText(messages);
-    const text = contentOf(data, { requireSubstance: true });
+    let text = contentOf(data, { requireSubstance: true });
+
+    // Narration around an otherwise good answer is STRIPPED, not rejected.
+    // Rejecting it cost the user the whole reply for a good question - observed
+    // live on a staffing question, where "two staff is the usual minimum" was
+    // thrown away with the preamble that described asking it.
+    if (looksLikeReasoningLeak(text)) {
+      const stripped = stripNarration(text);
+      if (stripped.length >= 20 && !looksLikeReasoningLeak(stripped)) {
+        log(chatId, "stripped narration from an otherwise usable reply");
+        text = stripped;
+      }
+    }
     // The invented-failure guard belongs HERE, in the tool loop, because that is
     // the only place that knows whether a tool genuinely failed. The model does
     // not, and will invent a failure it never received.

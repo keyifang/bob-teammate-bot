@@ -57,8 +57,10 @@ export function buildReplyPrompt({
   }
   if (firstContact) {
     sections.push(
-      "This is your first message with this person, so greet them briefly as " +
-        `${bobName}, an AI teammate, in 2-3 sentences, and then answer their message.`
+      "This is your first message with this person. Answer their message FIRST" +
+        ` and in full. Only if it leaves room, add one short line that you are ` +
+        `${bobName}, an AI teammate. Never greet instead of answering - observed` +
+        " live: a weather question got 'nice to meet you' and no weather at all."
     );
   }
 
