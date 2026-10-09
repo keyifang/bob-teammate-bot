@@ -67,7 +67,7 @@ import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { formatForTelegram, chunkMessage, escapeHtml } from "./formatting.js";
 import { routeMessage, stripAddress, isRelay, normalizeBotName } from "./bots.js";
-import { modelForBot } from "./model-config.js";
+import { modelForBot, modelChainFor, nextModelAfter } from "./model-config.js";
 import { planRelay, buildDiscussionContext, createTurnRegistry } from "./relay.js";
 import {
   selectWindow,
@@ -350,17 +350,29 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
   const apiUrl = route.apiUrl || MODEL_API_URL;
   const apiKey = route.apiKey || MODEL_API_KEY;
 
+// Reliability across free models varies by an order of magnitude - measured on
+  // the same prompt: 6/6 for one model, 1/4 for another - and roughly half of
+  // all calls to a saturated model fail. So exhausting one model and moving to
+  // the next recovers most of that. This matters more than any agent
+  // architecture: every extra call is another chance to fail.
+  const chain = modelChainFor(payload.model);
+  let currentModel = chain[0] ?? payload.model;
+
   for (let attempt = 0; attempt < OVERLOAD_MAX_ATTEMPTS; attempt++) {
     let res;
     try {
       res = await fetch(apiUrl, {
         method: "POST",
         headers: modelHeaders(route),
-        // session_id is a top-level body field, not a message. It is only sent
+        // The model in use is written into the body, so a fallback switch
+        // actually takes effect rather than retrying the saturated model.
+        // session_id is a top-level body field, not a message: it is only sent
         // when the caller knows the conversation, so a one-off call is not
         // pinned to a provider it has no cache on.
         body: JSON.stringify(
-          route.sessionId ? { ...payload, session_id: route.sessionId } : payload
+          route.sessionId
+            ? { ...payload, model: currentModel, session_id: route.sessionId }
+            : { ...payload, model: currentModel }
         ),
         // A free-tier model queues unpredictably and thinks at length, so the
         // wait is bounded generously rather than tightly. Aborting early means
@@ -389,6 +401,12 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
           await sleep(delay);
           continue;
         }
+        const next = await switchModelIfPossible(chatId, label, chain, currentModel, attempt);
+        if (next) {
+          currentModel = next;
+          lastOverload = "switched-model";
+          continue;
+        }
         throw new OverloadedError();
       }
       // The status and body are attached so the caller can distinguish a
@@ -409,6 +427,12 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
           const delay = overloadDelay(attempt);
           log(chatId, `${label} returned no choices (${text.slice(0, 80)}), retrying in ${delay}ms`);
           await sleep(delay);
+          continue;
+        }
+        const next = await switchModelIfPossible(chatId, label, chain, currentModel, attempt);
+        if (next) {
+          currentModel = next;
+          lastOverload = "switched-model";
           continue;
         }
         throw new OverloadedError();
@@ -454,6 +478,18 @@ async function modelRequest(chatId, label, payload, route = {}, meter = null) {
   // Unreachable: every path either returns or throws. Kept so a future edit
   // that falls through fails loudly rather than silently returning undefined.
   throw new OverloadedError(lastOverload);
+}
+
+// Moves to the next model in the chain when one is exhausted, or returns
+// false when the chain is spent. Used at both overload paths (a bad status and a
+// 200 carrying an error), because either shape means "this model is busy".
+async function switchModelIfPossible(chatId, label, chain, currentModel, attempt) {
+  const nextModel = nextModelAfter(chain, currentModel);
+  if (!nextModel) return false;
+  log(chatId, `${label}: ${currentModel} exhausted, switching to ${nextModel}`);
+  // A short pause so a chain switch is not a hot loop across providers.
+  await sleep(Math.min(overloadDelay(attempt), 2000));
+  return nextModel;
 }
 
 // A free-tier generation can come back truncated mid-thought - a 4-character
