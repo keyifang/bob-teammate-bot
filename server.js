@@ -558,6 +558,18 @@ const TOOL_CALL_MARKUP_RE = new RegExp(
 const TOOL_CALL_STRUCTURE_RE =
   /(?:\{\s*"?(?:tool_call|function_call|tool_use)"?\s*:)|(?:```\s*(?:tool_call|function_call|tool_use)\b)|(?:\btool_call\s*\(\s*\{)/i;
 
+// Opener, then evidence that this is narration rather than an answer. Kept
+// narrow so a real reply is never rejected.
+const NARRATION_OPENER_RE =
+  /^\s*(?:okay|ok|alright|hmm|so|let me|i need to|i'll|i will|first,?|thinking process|here'?s? (?:a )?thinking|the user (?:is asking|wants|asked)|we need to respond|i should respond|the style rules say)\b/i;
+
+// Narration ABOUT THE USER or THE INSTRUCTIONS, in any position. Observed live:
+// "The user is asking ... in a group chat context. I need to respond as Bob."
+// - a leak the previous opener-only pattern missed, because it narrates about
+// the PERSON rather than about the task.
+const NARRATION_ABOUT_RE =
+  /\b(?:the user (?:is asking|wants|asked|says|is in|mentioned)|we need to respond|i need to respond (?:as|for)|the style rules say|as per the (?:style )?rules|in a group chat context)\b/i;
+
 const REASONING_LEAK_RE =
   /^\s*(?:okay|ok|alright|hmm|so|let me|i need to|i'll|i will|first,?|thinking process|here'?s? (?:a )?thinking)\b[\s\S]{0,4000}?\n\s*(?:1\.|2\.|3\.|step 1|-\s)/i;
 
@@ -658,6 +670,14 @@ function parseTextToolCall(text) {
 
 function looksLikeReasoningLeak(text) {
   if (typeof text !== "string" || !text.trim()) return false;
+
+  // Narration about the USER or the INSTRUCTIONS is a leak wherever it appears,
+  // not only at the start. Checked before the markup patterns because it needs
+  // no interpretation.
+  if (NARRATION_ABOUT_RE.test(text)) return true;
+  // A narration opener followed by a long ramble. The length floor keeps a
+  // genuine short reply that happens to start "okay so" from being rejected.
+  if (NARRATION_OPENER_RE.test(text) && text.length > 220) return true;
 
   // Protocol markup is checked FIRST and on its own: it is unambiguous, and it
   // is the one shape that reaches a user as visibly broken output.

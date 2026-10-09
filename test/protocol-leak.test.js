@@ -331,3 +331,42 @@ test("an ordinary answer is never rejected", async () => {
     assert.equal(typeof looksLikeInventedToolFailure(ok, { anyToolFailed: false }), "boolean");
   }
 });
+
+// Narration ABOUT THE USER or the INSTRUCTIONS, in any position.
+//
+// OBSERVED live (2026-10-08): asked what to order for dinner, Bob replied
+// "The user is asking ... in a group chat context. I need to respond as Bob, a
+// teammate. The style rules say: ...". The previous detector required a
+// narration OPENER at the start, so a leak that narrates about the PERSON
+// rather than about the task walked straight through.
+test("narration about the user is caught wherever it appears", async () => {
+  const leak = await detector();
+  const observed =
+    'The user is asking "what should we order for dinner?" in a group chat context. ' +
+    "I need to respond as Bob, a teammate. The style rules say: short.";
+  assert.equal(leak(observed), true, "the observed leak must be caught");
+});
+
+test("narration about the instructions is caught", async () => {
+  const leak = await detector();
+  for (const t of [
+    "We need to respond as Bob, a teammate here in this group.",
+    "The style rules say to keep it short, so: hello.",
+    "As per the rules, I should respond in one sentence.",
+  ]) {
+    assert.equal(leak(t), true, `must catch: ${t.slice(0, 45)}`);
+  }
+});
+
+test("a real reply is never mistaken for narration", async () => {
+  const leak = await detector();
+  for (const t of [
+    "Beijing right now: 21C, partly cloudy.",
+    "okay so the meeting is thursday",
+    "Sam is my partner. Dinner idea: margherita, no cheese.",
+    "hey! considering Sam's diet - no peanuts for you",
+    "I can't look that up - check bom.gov.au",
+  ]) {
+    assert.equal(leak(t), false, `false positive: ${t.slice(0, 45)}`);
+  }
+});

@@ -21,6 +21,24 @@ test("a named third party is captured, because the name is what is needed later"
   assert.match(facts.join(" "), /Sam/);
 });
 
+test("a third party's attributes are NOT attributed to them", () => {
+  // Observed live: storing "Sam (my partner) is vegetarian" beside "I'm allergic
+  // to peanuts" produced "considering Sam's diet and peanut allergy" - reading as
+  // though SAM is allergic. That is a factual claim about a real person's
+  // health, inferred from a sentence about the speaker, so only the link is
+  // stored and the attribute stays with whoever said it.
+  const facts = extractFacts("my partner Sam is vegetarian and I'm allergic to peanuts");
+  const aboutSam = facts.filter((f) => /Sam/.test(f));
+  for (const f of aboutSam) {
+    assert.ok(
+      !/vegetarian|allerg/i.test(f),
+      `must not attribute an attribute to Sam: ${f}`
+    );
+  }
+  // The user's own allergy must still be captured, verbatim.
+  assert.match(facts.join(" "), /allerg/i);
+});
+
 test("credentials and card details are never stored", () => {
   // The single most damaging thing this feature could do.
   for (const t of [

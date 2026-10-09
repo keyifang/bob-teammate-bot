@@ -57,15 +57,43 @@ export function extractFacts(text) {
     const attr = rest.match(
       /\b(is|are|works as|lives in|likes|love|prefers|allergic to|vegetarian|vegan)\b([^.\n!?]{0,40})/i
     );
-    const detail = attr ? ` ${attr[1].toLowerCase()} ${attr[2].trim()}` : "";
-    facts.push(`${name} (my ${relation})${detail}`.trim().slice(0, MAX_FACT_LEN));
+    // Only the LINK to the third party is stored, never their attributes.
+    //
+    // Observed: storing "Sam (my partner) is vegetarian" alongside "I'm allergic
+    // to peanuts" produced "considering Sam's diet and peanut allergy" - which
+    // reads as though SAM is the one who is allergic. That is a factual claim
+    // about a person's health, inferred from a sentence about the speaker.
+    facts.push(`${name} is my ${relation}`.slice(0, MAX_FACT_LEN));
   }
 
   if (FIRST_PERSON_RE.test(raw)) {
     // Store the whole sentence: trimming it to the matched fragment loses the
     // subject, and "allergic to peanuts" without "I'm" is ambiguous.
+    //
+    // The third-party clause is removed first. "my partner Sam is vegetarian and
+    // I'm allergic to peanuts" stored whole reads back as "considering Sam's diet
+    // and peanut allergy" - a claim that SAM is the allergic one. That is a
+    // factual assertion about a real person's health, inferred from a sentence
+    // about the speaker, so it must not survive.
     const sentence = raw.split(/[.!?\n]/).find((s) => FIRST_PERSON_RE.test(s)) ?? raw;
-    facts.push(sentence.trim().slice(0, MAX_FACT_LEN));
+    let speakerOnly = sentence;
+    for (const m of sentence.matchAll(new RegExp(THIRD_PARTY_RE.source, "gi"))) {
+      const name = m[2].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const relation = m[1];
+      // From the third party up to the next first-person marker.
+      speakerOnly = speakerOnly.replace(
+        new RegExp(
+          `\\bmy\\s+${relation}\\s+${name}[^,.;]*(?=(,\\s*(?:and|but)\\s+)?\\s*(?:i\\b|i'|my\\b))`,
+          "i"
+        ),
+        ""
+      );
+    }
+    speakerOnly = speakerOnly
+      .replace(/\s{2,}/g, " ")
+      .replace(/^[\s,;]+/, "")
+      .trim();
+    if (speakerOnly) facts.push(speakerOnly.slice(0, MAX_FACT_LEN));
   }
 
   return [...new Set(facts.filter(Boolean))].slice(0, 3);
