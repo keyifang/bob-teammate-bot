@@ -678,8 +678,24 @@ function looksDegenerate(text) {
   const trimmed = text.trim();
   if (trimmed.length < 20) return false;
 
-  // A single token repeated back to back, e.g. "ellsellsellsells".
-  if (/(.{2,12}?)\1{4,}/.test(trimmed)) return true;
+  // A run of the same word repeated at least three times over, e.g.
+  // "networkellsellsellsellsells".
+  //
+  // Only word characters are matched, so "------" (a markdown horizontal rule,
+  // present in every structured document) does NOT match. Without that
+  // restriction a 3,693-character proposal was rejected as "degenerate
+  // repetition". Measured, not assumed.
+  //
+  // The backreference is built at runtime: in a JS string literal "\1" is an
+  // octal escape that strict mode rejects, and writing "\\1" there produces a
+  // literal backslash rather than a backreference.
+  // Both the character class and the backreference build their backslash at
+  // runtime. In a JS string literal "\\w" collapses to "w", which then matches a
+  // literal letter instead of a word character - and the guard silently caught
+  // nothing at all.
+  const BS = String.fromCharCode(92);
+  const DEGENERATE_TOKEN = new RegExp("([" + BS + "w]{3,})(?:" + BS + "1){2,}");
+  if (DEGENERATE_TOKEN.test(trimmed)) return true;
 
   // A short phrase repeated many times, e.g. "the the the the".
   const words = trimmed.toLowerCase().match(/[a-z']{2,}/g);

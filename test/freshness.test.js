@@ -56,9 +56,17 @@ test("the persona keeps caveats earned, not blanket", () => {
   );
 });
 
-test("the persona still forbids padding, so freshness rules do not undo brevity", () => {
-  assert.match(PERSONA_SYSTEM_PROMPT, /1-3 sentences/i);
-  assert.match(PERSONA_SYSTEM_PROMPT, /No preamble/i);
+test("the persona keeps chat short without sabotaging deliverables", () => {
+  // Measured: the old "1-3 sentences, hard cap" cut a requested proposal off
+  // mid-way, leaving placeholders standing. Brevity is for CONVERSATION.
+  assert.match(PERSONA_SYSTEM_PROMPT, /1-3 sentences/i, "chat answers stay short");
+  assert.match(
+    PERSONA_SYSTEM_PROMPT,
+    /deliverable|proposal|plan|draft/i,
+    "but a requested deliverable must be produced whole"
+  );
+  // And still no padding - brevity was never the problem, truncation was.
+  assert.match(PERSONA_SYSTEM_PROMPT, /[Nn]ever pad/i);
 });
 
 test("the persona still forbids pretending to have researched", () => {
