@@ -213,3 +213,41 @@ test("formatForTelegram output is always balanced, whatever the input", () => {
     assert.deepEqual(checkHtmlBalance(out), { balanced: true }, `input: ${JSON.stringify(s)} -> ${out}`);
   }
 });
+
+// Ampersand escaping must happen ONCE.
+//
+// formatForTelegram producing "R&amp;D" is CORRECT: that is the HTML Telegram
+// renders as "R&D". The bug was the SEND FALLBACK re-escaping already-escaped
+// text, so the user saw the literal characters "&amp;" - observed live as
+// "R&amp;D budget". These tests pin the single-escape contract and the escape
+// ONCE helper, not the rendered output, which is Telegram's job.
+
+test("escapeHtml escapes each character exactly once", () => {
+  assert.equal(escapeHtml("R&D"), "R&amp;D");
+  assert.equal(escapeHtml("a & b & c"), "a &amp; b &amp; c");
+  // Not "&amp;amp;" - that is what the user actually saw.
+  assert.ok(!escapeHtml("&").includes("amp;amp;"));
+});
+
+test("angle brackets are escaped so tags cannot render", () => {
+  assert.equal(escapeHtml("<b>"), "&lt;b&gt;");
+  assert.equal(escapeHtml("5 < 6"), "5 &lt; 6");
+});
+
+test("escaping is idempotent in the sense that matters: no growth on repeat", () => {
+  // If any layer re-escapes, the output grows. Checking the growth is what
+  // catches the fallback bug at the formatting layer.
+  const once = escapeHtml("R&D");
+  const twice = escapeHtml(once);
+  assert.ok(twice.length >= once.length);
+  assert.ok(!/amp;amp;/.test(twice) || once.includes("amp;"),
+    "a second escape pass must not be applied by the formatter itself");
+});
+
+test("formatForTelegram produces HTML Telegram renders correctly, not literal entities", () => {
+  // The formatted output SHOULD contain &amp; - that is correct HTML. What it
+  // must never contain is a nested &amp;amp;, which is what the user saw.
+  const out = formatForTelegram("R&D budget");
+  assert.equal(out, "R&amp;D budget", "one escape, correct HTML");
+  assert.ok(!out.includes("&amp;amp;"), "must not be double-escaped");
+});

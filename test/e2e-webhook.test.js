@@ -2330,6 +2330,53 @@ test("a BYOK user is not charged by a real reply", { skip }, async () => {
   assert.equal(ledger.rows[0].n, 0, "a BYOK user must have no credit ledger entry");
 });
 
+// The send FALLBACK, not the formatter.
+//
+// OBSERVED live (2026-10-08): Bob answered with "R&amp;D budget" and
+// "lines moving &amp; costs down" - literal HTML entities in a Telegram chat.
+// formatForTelegram producing &amp; is correct; the bug was the fallback path
+// re-escaping already-escaped text before resending. Unit tests cannot see it,
+// because the formatter was never at fault.
+test("a reply with an ampersand never shows the user an HTML entity", { skip }, async () => {
+  telegram = [];
+  const chatId = 4201;
+  await post(
+    "/telegram-webhook",
+    update({
+      updateId: 1200,
+      chatId,
+      fromId: 9001,
+      fromName: "KY",
+      // Asked directly, so the stub answers deterministically - the point of
+      // this test is the SEND path, not what the model happens to say.
+      text: `hey bot, what about R&D?`,
+    }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+
+  await waitFor(() => sentTo(chatId).length > 0, { label: "a reply" });
+  const text = sentTexts(chatId).join(" | ");
+  // The stub returns a fixed reply, so the assertion is on the SEND PATH: no
+  // entity may reach the user in any form.
+  assert.ok(!/&amp;amp;/.test(text), `double-escaped in the send path: ${text}`);
+});
+
+test("the fallback cannot double-escape even when it fires", { skip }, async () => {
+  const src = (await readFile(path.join(ROOT, "server.js"), "utf8")).replace(
+    new RegExp(String.fromCharCode(13, 10), "g"),
+    String.fromCharCode(10)
+  );
+  // Source check, because triggering a Telegram entity error needs the real
+  // rejection path: the fallback must resend the chunk it already has, not
+  // escape rawText a second time.
+  const start = src.indexOf("isEntitiesParseError(err))");
+  const body = src.slice(start, start + 900);
+  assert.ok(
+    !/escapeHtml\(rawText\)/.test(body),
+    "the fallback must not re-escape already-formatted text"
+  );
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(

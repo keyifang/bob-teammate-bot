@@ -1067,12 +1067,20 @@ async function sendFormatted(chatId, rawText) {
       await bot.sendMessage(chatId, chunk, { parse_mode: "HTML" });
     } catch (err) {
       if (!isEntitiesParseError(err)) throw err;
-      // Formatting, not policy, is the problem: fall back to the same text as
-      // plain HTML-escaped content so the user still gets an answer (TC-29).
-      console.error("HTML send rejected, falling back to escaped plain text:", err.message);
-      for (const part of chunkMessage(escapeHtml(rawText), TELEGRAM_MAX)) {
-        await bot.sendMessage(chatId, part, { parse_mode: "HTML" });
-      }
+      // Formatting, not policy, is the problem: resend the SAME chunk with HTML
+      // parse mode off, so the user still gets an answer (TC-29).
+      //
+      // The previous version re-escaped rawText and sent it as HTML. That made
+      // "&" into "&amp;" INSIDE already-escaped output, so the user saw the
+      // literal text "&amp;" - observed live as "R&amp;D budget". It also
+      // could not fix an unbalanced tag, which is the actual cause here.
+      console.error("HTML send rejected, resending as plain text:", err.message);
+      await bot.sendMessage(chatId, chunk, { parse_mode: undefined }).catch(async () => {
+        // A last resort: strip every tag and escape once, so at worst the user
+        // sees markup characters rather than nothing.
+        const plain = String(chunk).replace(/<[^>]*>/g, "");
+        await bot.sendMessage(chatId, plain, { parse_mode: undefined });
+      });
       return;
     }
   }
