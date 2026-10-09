@@ -421,3 +421,43 @@ test("the persona points weather questions at the weather tool", async () => {
     "the persona must not tell the model to search for weather"
   );
 });
+
+// Air quality shares the weather tool, because the AIR-QUALITY sites fail the
+// same way: search returns aqicn / aqitrends / iqair and those answer 404 or
+// 429 to a datacenter IP - observed live as a web_fetch 404 followed by "the
+// search provider is unavailable right now".
+test("the weather tool serves air quality for a city", async () => {
+  const { runWeather } = await import("../tools.js");
+  const out = await runWeather("Beijing", { airQuality: true });
+  assert.match(out, /Beijing/, `the place must be named back: ${out}`);
+  assert.match(out, /AQI\s*\d+/i, "an AQI figure must be present");
+  // A band, not just a number - the model would otherwise guess the severity.
+  assert.match(out, /Good|Fair|Moderate|Poor|Extremely poor/i);
+  assert.match(out, /PM2\.5/i, "the main pollutant must be included");
+});
+
+test("air quality does not change the weather path", async () => {
+  const { runWeather } = await import("../tools.js");
+  const weather = await runWeather("Melbourne", { airQuality: false });
+  assert.match(weather, /°C/, "weather still reports temperature");
+  assert.ok(!/AQI/i.test(weather), "and must not mix in air quality");
+});
+
+test("the air-quality path fails gracefully, never throwing into the tool loop", async () => {
+  const { runWeather } = await import("../tools.js");
+  const missing = await runWeather("Nowhereville", { airQuality: true });
+  assert.match(missing, /Could not find|Try adding a country/i);
+  assert.equal(typeof missing, "string");
+});
+
+test("the schema advertises the air-quality switch, or the model cannot ask for it", async () => {
+  const { TOOL_SCHEMAS } = await import("../tools.js");
+  const schema = TOOL_SCHEMAS.find((t) => t.function.name === "weather");
+  assert.ok(
+    schema.function.parameters.properties.air_quality,
+    "the parameter must exist"
+  );
+  assert.deepEqual(schema.function.parameters.required, ["location"], "location stays required");
+  // The description must name air quality, or the model searches instead.
+  assert.match(schema.function.description, /air quality|AQI/i);
+});

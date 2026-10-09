@@ -39,13 +39,18 @@ export const TOOL_SCHEMAS = [
     function: {
       name: "weather",
       description:
-        "Get the CURRENT weather for a city: temperature, feels-like, humidity, wind and a plain-English description. Use this for ANY weather question. It is fast, reliable and needs no key, so prefer it over searching and fetching weather sites - most news and weather sites block automated requests and will fail.",
+        "Get CURRENT conditions for a city: weather (temperature, feels-like, humidity, wind) and AIR QUALITY (AQI, PM2.5, PM10, ozone). Use this for any weather, air quality, pollution, haze, smog or AQI question. It is fast, reliable and needs no key, so prefer it over searching and fetching those sites - most news, weather and air-quality sites block automated requests and will fail.",
       parameters: {
         type: "object",
         properties: {
           location: {
             type: "string",
             description: "City name, optionally with a country code, e.g. 'Melbourne' or 'Melbourne, Australia'",
+          },
+          air_quality: {
+            type: "boolean",
+            description:
+              "Set true when the question is about air quality, pollution, haze, smog, AQI or pollutants. Omit it for weather.",
           },
         },
         required: ["location"],
@@ -294,6 +299,61 @@ const WMO = {
 };
 
 /**
+ * Current air quality for a city, via Open-Meteo.
+ *
+ * Added for the same reason as the weather path. Search for air quality returns
+ * aqicn / aqitrends / iqair, and those intermittently answer 404 or 429 to a
+ * datacenter IP - observed live as a web_fetch 404, after which the model had
+ * no data and told the user "the search provider is unavailable". Open-Meteo
+ * answers in under a second for every city tried.
+ *
+ * EU AQI bands, so the model gets "Moderate" rather than a bare number.
+ */
+const AQI_BANDS = [
+  [20, "Good"],
+  [40, "Fair"],
+  [60, "Moderate"],
+  [80, "Poor"],
+  [100, "Very poor"],
+  [Infinity, "Extremely poor"],
+];
+
+function aqiBand(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return "unknown";
+  for (const [limit, label] of AQI_BANDS) {
+    if (v <= limit) return label;
+  }
+  return "Extremely poor";
+}
+
+async function runAirQuality(hit) {
+  const res = await fetch(
+    `https://air-quality-api.open-meteo.com/v1/air-quality` +
+      `?latitude=${hit.latitude}&longitude=${hit.longitude}` +
+      `&current=pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide&timezone=auto`,
+    { signal: AbortSignal.timeout(12000) }
+  );
+  if (!res.ok) return `Air quality lookup failed (${res.status}).`;
+  const c = (await res.json())?.current;
+  if (!c) return "No current air-quality data returned.";
+
+  // Open-Meteo's european_aqi field is the band-ready number; fall back to a
+  // EU-style estimate when it is absent so the model still gets a figure.
+  const estimate = Number.isFinite(c.european_aqi)
+    ? c.european_aqi
+    : Math.round((2 * (c.pm2_5 ?? 0) + (c.pm10 ?? 0)) / 3);
+
+  const place = [hit.name, hit.admin1, hit.country_code].filter(Boolean).join(", ");
+  const parts = [
+    `Air quality for ${place}: EU AQI ${Math.round(estimate)} (${aqiBand(estimate)}).`,
+    `PM2.5 ${c.pm2_5 ?? "?"} ug/m3, PM10 ${c.pm10 ?? "?"} ug/m3, ozone ${c.ozone ?? "?"} ug/m3.`,
+  ];
+  if (Number.isFinite(c.nitrogen_dioxide)) parts.push(`Nitrogen dioxide ${c.nitrogen_dioxide} ug/m3.`);
+  return parts.join(" ");
+}
+
+/**
  * Current weather for a city, via Open-Meteo.
  *
  * Added because the search path cannot answer a weather question from this
@@ -305,7 +365,7 @@ const WMO = {
  * Chosen over wttr.in as the primary because it is a documented API rather
  * than a scraping-friendly front end, and it needs no key.
  */
-export async function runWeather(location) {
+export async function runWeather(location, { airQuality = false } = {}) {
   const place = String(location ?? "").trim();
   if (!place) return "No location was given.";
 
@@ -329,6 +389,8 @@ export async function runWeather(location) {
   const wx = await wxRes.json();
   const c = wx?.current;
   if (!c) return `No current conditions returned for ${place}.`;
+
+  if (airQuality) return runAirQuality(hit);
 
   const desc = WMO[c.weather_code] ?? `Conditions code ${c.weather_code}`;
   const place_ = [hit.name, hit.admin1, hit.country_code].filter(Boolean).join(", ");
@@ -663,7 +725,9 @@ function decodeEntities(s) {
 
 export async function executeTool(name, args = {}) {
   if (name === "owl_research") return await runOwlResearch(args.query);
-  if (name === "weather") return await runWeather(args.location);
+  if (name === "weather") {
+    return await runWeather(args.location, { airQuality: Boolean(args.air_quality) });
+  }
   if (name === "web_search") return await runDdgSearch(args.query, args.max_results);
   if (name === "web_fetch") return await runWebFetch(args.url);
   throw new Error(`Unknown tool: ${name}`);
