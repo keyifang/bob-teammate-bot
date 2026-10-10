@@ -8,6 +8,42 @@ natively in Telegram.
 Bob always says it is an AI. That is a hard requirement, not a style setting —
 see [AI disclosure](#ai-disclosure).
 
+## What Bob is for
+
+A personal assistant, a helpful colleague, and a friend you add to a group chat
+for **chatting, assistance, discussion, brainstorming, ideation, planning and
+drafting proposals**.
+
+Weather was a test case, not the product. The capabilities that matter are the
+conversational ones: holding a thread across turns, asking the clarifying
+question that actually changes the answer, pushing back, and producing a
+structured artefact when asked for one.
+
+### Multi-persona inside one bot
+
+A group can hold several named bots — `/addbot Alice`, `/addbot Bob` — and they
+discuss with each other, with the human able to interject at any point.
+
+This is forced by Telegram, not a design choice. Verified in the official Bot API
+FAQ: *"bots will not be able to see messages from other bots regardless of
+mode."* Real bot-to-bot conversation is impossible. So the personas live **inside
+one bot**, which is the only arrangement that works, and each is routed by name.
+
+### Verified against five real users
+
+`scripts/persona-test.mjs` drives the real prompt assembly and the real model.
+
+| Persona | Need | Result |
+|---|---|---|
+| Sam, solo founder | decides fast, wants the number and the risk | answers the 80k question with the actual cost categories |
+| Priya, parent | cares about the kids, not the itinerary | heat, thunderstorms, school holidays |
+| Alex, engineer | wants the actual error, not reassurance | unclosed streams and socket handling |
+| Maya, writer | needs a real artefact | 4,691-char proposal: summary, phases, budget |
+| Dev, chatter | quick facts, will not wait | 20°C, clear, 15km/h wind |
+
+5/5 on-topic, with routing correct: proposals and plans take the stronger model,
+everything else the fast one.
+
 ## Layout
 
 | File | Role |
@@ -21,6 +57,9 @@ see [AI disclosure](#ai-disclosure).
 | `relay.js` | Relay sequencing: fan-out cap, discussion context, cancellation |
 | `quota.js` | Plans and per-message caps (search budget, tool hops) |
 | `document.js` | HTML export rendering, incl. escaping |
+| `memory.js` | What Bob remembers about a user, and what it refuses to |
+| `router.js` | Task routing: which model answers a chat vs a draft |
+| `speak.js` | Whether Bob joins a group conversation, or stays out |
 | `export.js` | Format registry (pdf/html/markdown/text/csv/docx/xlsx/zip) |
 | `pdf.js` | Runs `pdf_export.py` (ReportLab) |
 | `pdf_export.py` | PDF generation; transliterates non-Latin-1 characters |
@@ -63,6 +102,53 @@ properties fall out of the key rather than a filtering convention:
 - a bot carries what it learned in one group into the next, because
   `bot_owner_memory` is keyed on `bot_id` alone
 - two owners' bots never mix, because `bot_id → owner_user_id` is a foreign key
+
+## Model routing, and why it exists
+
+Bob is two different jobs. Chatting in a group is latency-sensitive — the
+experience *is* the speed — while researching or drafting can wait and wants a
+stronger model.
+
+Measured, four calls each on the same conversational prompt:
+
+```
+nvidia/nemotron-3.5-lightning:free       5.0s 1.4s 3.0s 4.8s   4/4 ok
+nvidia/nemotron-3-ultra-550b-a55b:free  6.4s 13.3s 0.4s 2.8s   3/4 ok
+```
+
+Lightning is both faster *and* more reliable on the free tier, so it leads for
+chat and research; the reasoning model is reserved for drafts. A group aside
+answers in ~4s.
+
+The classifier is a regex, not a model call. Roughly half of all calls to a
+saturated free tier fail, so an extra classification per message is a
+reliability cost spent on a decision the regex gets right. `"just chat"` from the
+person beats any heuristic.
+
+## When Bob speaks
+
+The old rule was a question mark plus a cooldown, so he interjected on any
+question to anyone. Now he speaks when **addressed**, or when the question is
+squarely his domain.
+
+The cooldown governs **volunteering, not being spoken to**. Someone who names
+Bob twice in a minute is waiting, and ignoring the second message reads as
+broken.
+
+## The humanizer is opt-in
+
+It was a second model call per reply, purely to adjust tone. Measured on a reply
+the main model had already written correctly:
+
+```
+usable=2   narrated=4   empty=0
+```
+
+It narrates its reasoning two runs in three, and the persona **already**
+specifies the register it was being asked to add — short, no preamble, casual,
+contractions. On a half-saturated tier it was a second chance to fail.
+
+Set `HUMANIZE=true` to restore it; `HUMANIZE_DEFAULT_OFF=false` forces it on.
 
 ## Plans and quotas
 
@@ -138,7 +224,25 @@ containing `</html>` or a `<script>` tag cannot alter or truncate the document.
 Project paths are checked too, because a path from a chat message is
 attacker-influenced and a traversal would escape the archive.
 
-## Memory model
+## Memory
+
+### What you told Bob
+
+A fact, not a summary. Told *"my partner Sam is vegetarian and I'm allergic to
+peanuts"*, then asked *"what should we order for dinner?"* in **another group**,
+Bob answers from it.
+
+Facts are keyed on the **user**, not the chat — you are the same person in every
+group. A summary is regenerated by a model call that can blur any of it; a row
+cannot. Credentials, card numbers and bank details are refused outright, and a
+correction retracts a stale fact while keeping the history of what was believed.
+
+Only the **link** to a third party is kept. Storing *"Sam (my partner) is
+vegetarian"* beside *"I'm allergic to peanuts"* produced *"considering Sam's diet
+and peanut allergy"* — a claim that SAM is allergic. That is a factual
+assertion about a real person's health, so it must not survive.
+
+### Chat history
 
 Three tiers, assembled broadest-first into every reply prompt.
 
