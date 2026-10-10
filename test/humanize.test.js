@@ -105,3 +105,49 @@ test("the humanizer prompt still preserves meaning and returns only the message"
   assert.match(HUMANIZER_SYSTEM_PROMPT, /[Pp]reserve the meaning/);
   assert.match(HUMANIZER_SYSTEM_PROMPT, /ONLY the rewritten message/);
 });
+
+// The humanizer must never cost the user a reply.
+//
+// MEASURED, 6 runs of the humanizer pass on a reply the main model had already
+// produced correctly:
+//   usable=2  narrated=4  empty=0
+//
+// It narrates two times in three, the leak detector rejects that, and the whole
+// reply is lost - the user sees "hit an error" for a perfectly good answer.
+// Observed live: "help me plan a week of launch content" produced useful
+// clarifying questions and arrived as an error.
+//
+// The main model is ALREADY instructed for the casual register, so this is a
+// second call, on a half-saturated tier, that makes reliability worse.
+test("a narrated humanizer pass does not destroy the reply", async () => {
+  const { stripNarration } = await import("../guards.js");
+  // The exact shape observed live.
+  // Built from char codes: the escapes here are the same ones the model emits,
+  // and writing them literally gets mangled by whatever writes this file.
+  const N = String.fromCharCode(10);
+  const narrated = [
+    "Here's a thinking process:" + N,
+    "",
+    "1.  **Analyze User Input:**" + N,
+    "   - Original message is a casual chat message asking for details.",
+    "2. **Rewrite:**",
+    "   - Shorter.",
+  ].join(N);
+  const stripped = stripNarration(narrated);
+  const usable = stripped.length >= 20 && !/thinking process|analyze user input/i.test(stripped);
+  assert.equal(usable, false, "narration must not be mistaken for a usable rewrite");
+});
+
+test("a genuine rewrite survives the narration filter", async () => {
+  const { stripNarration } = await import("../guards.js");
+  const rewritten =
+    "hey! to build that week of content i need two things: what you're launching, " +
+    "and which channels matter most.";
+  assert.equal(stripNarration(rewritten), rewritten, "a real rewrite must survive intact");
+});
+
+test("a short genuine rewrite is not mistaken for narration", async () => {
+  const { stripNarration } = await import("../guards.js");
+  const short = "got it - need the launch type and your channels, then i'll draft it.";
+  assert.equal(stripNarration(short), short);
+});

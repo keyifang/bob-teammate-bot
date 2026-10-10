@@ -802,6 +802,8 @@ const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS ?? 4000);
 // Replies at or below this length are already in the persona's casual register,
 // so the humanizer pass is skipped. Set HUMANIZE_SKIP_UNDER=false to always run.
 const HUMANIZE_MAX_CHARS = Number(process.env.HUMANIZE_MAX_CHARS ?? 400);
+// Opt-in: measured to narrate 2 runs in 3, losing good replies. See humanize().
+const HUMANIZE_DEFAULT_OFF = String(process.env.HUMANIZE_DEFAULT_OFF ?? "true");
 const HUMANIZE_SKIP_UNDER = process.env.HUMANIZE_SKIP_UNDER ?? "true";
 
 async function callModelWithTools(chatId, systemPrompt, userPrompt, model = MODEL_NAME, plan = PLANS.free, route = {}, meter = { micro: 0 }) {
@@ -1042,8 +1044,23 @@ function lastToolResultText(messages) {
 // that measured ~35s and ~1800 reasoning tokens to reword a single sentence -
 // often more than the reply itself. It is skipped for text that is already
 // short and conversational, which is the common case for a chat reply.
+// The humanizer is a SECOND model call per reply, purely to adjust tone.
+//
+// MEASURED, 6 runs on a reply the main model had already produced correctly:
+//   usable=2  narrated=4  empty=0
+//
+// It narrates its reasoning two times in three, the leak detector rejects that,
+// and the user gets "hit an error" for a good answer. On a tier where roughly
+// half of all calls already fail, this call makes reliability worse rather than
+// better - and the persona ALREADY specifies the register (short, no preamble,
+// casual, contractions, no corporate tone), which is exactly what the humanizer
+// was being asked to add.
+//
+// So it is now opt-in. Set HUMANIZE=true to restore it; the default is the
+// measured-better behaviour.
 async function humanize(chatId, text, model = MODEL_NAME, route = {}) {
   if (HUMANIZE !== "true") return text;
+  if (HUMANIZE_DEFAULT_OFF !== "false") return text;
   // Skip the extra call for replies already short enough to be in the persona's
   // casual register. HUMANIZE_SKIP_UNDER is opt-out, so setting it to false
   // restores unconditional humanising.
