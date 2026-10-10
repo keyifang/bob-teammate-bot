@@ -486,6 +486,14 @@ export async function linkBotToChat(botId, chatId, { relayPosition = 0, isPrimar
   );
 }
 
+// The bot's own character. Was never written anywhere: the column existed and
+// every named bot used the shared prompt, so "Alice" and "Bob" were the same
+// voice with two labels.
+export async function setBotPersona(botId, persona) {
+  const value = typeof persona === "string" && persona.trim() ? persona.trim() : null;
+  await getPool().query(`UPDATE bots SET persona = $1 WHERE bot_id = $2`, [value, botId]);
+}
+
 export async function getBotsForChat(chatId) {
   const { rows } = await getPool().query(
     `SELECT b.*, bc.relay_position, bc.is_primary

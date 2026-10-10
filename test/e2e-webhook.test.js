@@ -2377,6 +2377,98 @@ test("the fallback cannot double-escape even when it fires", { skip }, async () 
   );
 });
 
+// --- Per-bot persona ---------------------------------------------------------
+//
+// Every named bot used to share ONE system prompt, so "Alice" and "Bob" were the
+// same voice with two labels - and a relay discussion between them was one
+// person answering twice. persona.js existed, was tested, and was never wired.
+
+test("/persona sets a bot's character and it reaches the model", { skip }, async () => {
+  calls = [];
+  const chatId = 4401;
+  const userId = 9901;
+  const botId = await seedNamedBot(chatId, {
+    ownerUserId: userId,
+    displayName: "Strategist",
+    modelTier: "persona-test:free",
+    relayPosition: 0,
+  });
+  await admin.query(
+    "INSERT INTO users (user_id, name) VALUES ($1, 'Owner') ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name",
+    [userId]
+  );
+
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 2000, chatId, fromId: userId, fromName: "Owner",
+      text: "/persona Strategist strategist" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(
+    async () => {
+      const { rows } = await admin.query("SELECT persona FROM bots WHERE bot_id = $1", [botId]);
+      return rows[0]?.persona != null;
+    },
+    { label: "persona stored" }
+  );
+
+  const { rows } = await admin.query("SELECT persona FROM bots WHERE bot_id = $1", [botId]);
+  assert.match(rows[0].persona, /strategist/i, "the trait must be stored, not the word the user typed");
+
+  // The decisive part: the stored character must reach the MODEL, not just the
+  // database. A persona that never reaches the prompt is the bug this fixes.
+  calls = [];
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 2001, chatId, fromId: userId, fromName: "Owner", text: "@Strategist thoughts?" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(() => calls.some((c) => c.body.model === "persona-test:free"), {
+    label: "a persona call",
+  });
+  const call = calls.find((c) => c.body.model === "persona-test:free");
+  const system = call.body.messages.find((m) => m.role === "system")?.content ?? "";
+  assert.match(system, /Strategist/, "the bot's own name must be in its system prompt");
+  assert.match(system, /pushes back|strategist/i, "and its character, not just its name");
+});
+
+test("two bots with different personas get genuinely different system prompts", { skip }, async () => {
+  const chatId = 4402;
+  const userId = 9902;
+  await admin.query(
+    "INSERT INTO users (user_id, name) VALUES ($1, 'Owner') ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name",
+    [userId]
+  );
+  await admin.query(
+    "INSERT INTO chats (chat_id, title) VALUES ($1, 'Personas') ON CONFLICT (chat_id) DO NOTHING",
+    [chatId]
+  );
+
+  const a = await seedNamedBot(chatId, { ownerUserId: userId, displayName: "Blunt", modelTier: "p-a:free", relayPosition: 0 });
+  const b = await seedNamedBot(chatId, { ownerUserId: userId, displayName: "Careful", modelTier: "p-b:free", relayPosition: 1 });
+  await admin.query("UPDATE bots SET persona = $1 WHERE bot_id = $2", ["a blunt strategist who pushes back", a]);
+  await admin.query("UPDATE bots SET persona = $1 WHERE bot_id = $2", ["a careful analyst who flags uncertainty", b]);
+
+  calls = [];
+  await post(
+    "/telegram-webhook",
+    update({ updateId: 2002, chatId, fromId: userId, fromName: "Owner", text: "@Blunt @Careful settle this" }),
+    { "X-Telegram-Bot-Api-Secret-Token": SECRET }
+  );
+  await waitFor(
+    () => calls.filter((c) => c.body.model === "p-a:free" || c.body.model === "p-b:free").length >= 2,
+    { label: "both personas answered", timeout: 30000 }
+  );
+
+  const sysOf = (model) =>
+    calls.find((c) => c.body.model === model)?.body.messages.find((m) => m.role === "system")?.content ?? "";
+  const sa = sysOf("p-a:free");
+  const sb = sysOf("p-b:free");
+  assert.ok(sa.includes("pushes back"), `Blunt's prompt must carry its character: ${sa.slice(0, 100)}`);
+  assert.ok(sb.includes("flags uncertainty"), `Careful's prompt must carry its character: ${sb.slice(0, 100)}`);
+  assert.notEqual(sa, sb, "two personas must not be the same prompt");
+});
+
 test("Phase 5: each bot in a relay turn keeps its own memory", { skip }, async () => {
   const chatId = 3201;
   const { rows } = await admin.query(

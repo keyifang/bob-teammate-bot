@@ -655,3 +655,28 @@ test("a blank fact is refused rather than stored as empty noise", { skip }, asyn
   assert.equal(await db.rememberFact(FACT_USER, "   ", FACT_CHAT_A), null);
   assert.equal(await db.rememberFact(FACT_USER, null, FACT_CHAT_A), null);
 });
+
+test("a bot's persona persists and can be changed", { skip }, async () => {
+  // bots.owner_user_id is a foreign key, so the owner must exist first.
+  await db.upsertUser(OWNER_1, "Owner One");
+  const bot = await db.createBot({
+    ownerUserId: OWNER_1,
+    telegramUserId: null,
+    displayName: "Voice",
+  });
+  assert.equal(bot.persona, null, "a new bot has no persona");
+
+  await db.setBotPersona(bot.bot_id, "a blunt strategist who pushes back");
+  const { rows } = await admin.query("SELECT persona FROM bots WHERE bot_id = $1", [bot.bot_id]);
+  assert.equal(rows[0].persona, "a blunt strategist who pushes back");
+
+  // Changing it replaces rather than appends, so /persona is idempotent.
+  await db.setBotPersona(bot.bot_id, "a careful analyst");
+  const { rows: after } = await admin.query("SELECT persona FROM bots WHERE bot_id = $1", [bot.bot_id]);
+  assert.equal(after[0].persona, "a careful analyst");
+
+  // Clearing it is allowed - the bot falls back to the shared register.
+  await db.setBotPersona(bot.bot_id, null);
+  const { rows: cleared } = await admin.query("SELECT persona FROM bots WHERE bot_id = $1", [bot.bot_id]);
+  assert.equal(cleared[0].persona, null);
+});

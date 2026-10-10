@@ -61,6 +61,7 @@ import {
   getProjectManifest,
   createBot,
   getBotByName,
+  setBotPersona,
   linkBotToChat,
   countBotsForOwner,
   acquireChatLock,
@@ -69,6 +70,7 @@ import {
 import { TOOL_SCHEMAS, executeTool, noteToolCall } from "./tools.js";
 import { buildReplyPrompt } from "./prompt.js";
 import { looksLikeInventedToolFailure, stripNarration } from "./guards.js";
+import { personaSystemPrompt, resolvePersona, describeTraits } from "./persona.js";
 import { extractFacts, looksLikeCorrection, formatFacts } from "./memory.js";
 import { routeFor } from "./router.js";
 import { shouldSpeak, CONFIDENT_NOISE } from "./speak.js";
@@ -1181,7 +1183,10 @@ async function sendNamedBotReply(chatId, senderId, bot, userPrompt, { record = t
   const meter = { micro: 0 };
   let reply;
   try {
-    reply = await callModelWithTools(chatId, PERSONA_SYSTEM_PROMPT, userPrompt, model, plan, route, meter);
+    // This bot's OWN persona. Reading the shared prompt here was why "Alice"
+    // and "Bob" were the same person with two labels, which made a relay
+    // discussion one voice answering twice.
+    reply = await callModelWithTools(chatId, personaSystemPrompt(bot), userPrompt, model, plan, route, meter);
   } catch (err) {
     console.error(`Reply from ${personaName} failed:`, err.message);
     reply = err?.overloaded ? OVERLOADED_REPLY : FALLBACK_REPLY;
@@ -1238,7 +1243,7 @@ async function buildPersonaPrompt(bot, chatId, senderName, text, discussion = ""
   const factsBlock = formatFacts(facts);
 
   return orderForCache({
-    persona: PERSONA_SYSTEM_PROMPT,
+    persona: personaSystemPrompt(bot),
     // Facts sit high in the prompt so they are part of the CACHED prefix
     // rather than something that changes per message.
     // Facts ADD to tier C rather than replacing it: tier C is the rolling
@@ -1851,6 +1856,67 @@ async function handleProjectZipCommand(chatId, text, sender) {
 // This is how a user creates a bot at all. Without it the bots table could only
 // be populated by hand, which made the whole named-bot feature unreachable
 // from the product.
+// /persona <bot> <trait|description> - give a bot its own character.
+//
+// Without this every named bot shares one system prompt, so "Alice" and "Bob"
+// are the same voice with two labels and a discussion between them is one person
+// answering twice. A different JUDGEMENT is what makes a second bot worth having.
+async function handlePersonaCommand(chatId, text, sender) {
+  const parsed = parseCommand(text);
+  if (!parsed || parsed.command !== "persona") return false;
+
+  const bots = await getBotsForChat(chatId);
+  const mine = bots.filter((b) => Number(b.owner_user_id) === Number(sender.id));
+  if (!mine.length) {
+    await sendFormatted(chatId, "You don't have a bot in this chat yet. Try /addbot <name>.");
+    return true;
+  }
+
+  const [name, ...rest] = parsed.args.split(/\s+/).filter(Boolean);
+  // With no argument at all, show the presets rather than erroring - the user
+  // cannot guess the trait names.
+  if (!name) {
+    await sendFormatted(
+      chatId,
+      `Which bot, and what character?
+
+/persona <bot> <trait>
+
+Traits:
+${describeTraits().join(String.fromCharCode(10))}
+
+Or give your own short description instead of a trait.`
+    );
+    return true;
+  }
+
+  const target = mine.find((b) => b.display_name.toLowerCase() === name.toLowerCase());
+  if (!target) {
+    await sendFormatted(chatId, `You don't have a bot called "${name}". Yours: ${mine.map((b) => b.display_name).join(", ")}`);
+    return true;
+  }
+
+  const body = rest.join(" ").trim();
+  if (!body) {
+    await sendFormatted(chatId, `What character should ${target.display_name} have? Traits:
+${describeTraits().join(String.fromCharCode(10))}`);
+    return true;
+  }
+
+  const resolved = resolvePersona(body);
+  if (!resolved.ok) {
+    await sendFormatted(chatId, resolved.error);
+    return true;
+  }
+
+  await setBotPersona(target.bot_id, resolved.persona);
+  await sendFormatted(
+    chatId,
+    `${target.display_name} is now ${resolved.persona}.`
+  );
+  return true;
+}
+
 async function handleAddBotCommand(chatId, text, sender) {
   const parsed = parseCommand(text);
   if (!parsed || parsed.command !== "addbot") return false;
@@ -1936,6 +2002,7 @@ async function handleHelpCommand(chatId, text) {
       "/bot_model [name] - choose the model this chat's bot uses",
       "/credits - balance and top-up",
       "/addbot <name> - add a named bot to this chat",
+      "/persona <bot> <trait> - give a bot its own character",
       "/export [format] [title] - export the last answer (pdf, html, markdown, text, csv)",
       "/save_project <name> <path>::<contents> ... - store a small project",
       "/project_zip <name> - get a stored project back as a zip",
@@ -2248,6 +2315,9 @@ async function handleUpdate(update) {
     return;
   }
   if (await handleAddBotCommand(chatId, text, sender)) {
+    return;
+  }
+  if (await handlePersonaCommand(chatId, text, sender)) {
     return;
   }
   if (await handleCreditsCommand(chatId, text, sender)) {
